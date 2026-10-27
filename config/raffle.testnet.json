@@ -1,0 +1,29 @@
+{
+  "chain": {
+    "network": "test",
+    "genesis_height": 4547139,
+    "blocks_per_round": 24,
+    "target_spacing_secs": 25,
+    "marginal_fee_zat": 5000,
+    "drand": {
+      "beacon_id": "quicknet",
+      "chain_hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+      "public_key": "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a",
+      "period_secs": 3,
+      "genesis_time": 1692803367,
+      "scheme": "bls-unchained-g1-rfc9380"
+    },
+    "reveal_delay_secs": 900,
+    "mtp_window": 11,
+    "honest_clock_skew_secs": 300
+  },
+  "game": {
+    "ticket_price_zat": 100000,
+    "entry_fee_zat": 5000,
+    "output_fee_zat": 5000
+  },
+  "vault_address": "utest1wymx3txpwx296eau9ry68l0m6eqqg9c0hxv9h36tx2ayck74tk3pxu0q5zwcygph404lwhfv09sgt0tpu28ggnyh8ejte5t6dqucymrn",
+  "sealing_public_key": "1b4486a11f9d42a56ba50b0ee72555bd267d7f3f1f939aca7484bdcf2462ae16",
+  "uivk": "uivktest13nt956h4cz8uzjyt0rglc89nufh7geg0fvtm558eakqju86pfya4al0a3llla7glmc37zvvul9wluvgzdzgstxa5kw7we9q59v7k9jpcxeyrp9803g4qga6843k4gpgyl72shw09xv",
+  "initial_carry_zat": 0
+}

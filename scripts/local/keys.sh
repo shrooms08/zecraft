@@ -74,9 +74,9 @@ done
 ok=1
 for i in 0 1 2; do
   # A ceremony that hangs is killed after 120 s.
-  ( sleep 120; kill "${pids[$i]}" 2>/dev/null ) & watchdog=$!
+  { sleep 120; kill "${pids[$i]}" 2>/dev/null; } 2>/dev/null & watchdog=$!
   wait "${pids[$i]}" || ok=0
-  kill "$watchdog" 2>/dev/null || true
+  { kill "$watchdog"; wait "$watchdog"; } 2>/dev/null || true
 done
 [ "$ok" = 1 ] || { tail -20 .zecraft/logs/dkg-*.log >&2; die "DKG failed (logs above)"; }
 grep -h "DKG complete\|sealing public key" .zecraft/logs/dkg-*.log || true
