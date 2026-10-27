@@ -35,7 +35,7 @@ pub const ENCAPPED_KEY_LEN: usize = 32;
 pub const TAG_LEN: usize = 16;
 
 /// Errors from sealing and opening.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SealError {
     #[error("sealing public key is not a valid 32-byte X25519 point")]
     InvalidPublicKey,

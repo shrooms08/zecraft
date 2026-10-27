@@ -18,12 +18,15 @@
 //!   clock, fees and beacon every game shares.
 //! * [`draw`]: rounds, drand beacons, the timing rule and unbiased draws.
 //! * [`entry`]: the entry memo, the sealed payout receiver and ZIP 321.
+//! * [`rules`]: the [`Rules`](rules::Rules) trait a game implements, the
+//!   generic [`Settlement`](rules::Settlement) and its enforced invariants.
 
 #![forbid(unsafe_code)]
 
 pub mod draw;
 pub mod entry;
 pub mod params;
+pub mod rules;
 
 /// Zatoshis per ZEC.
 pub const COIN: u64 = 100_000_000;

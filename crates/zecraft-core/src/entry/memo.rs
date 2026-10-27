@@ -113,7 +113,7 @@ pub trait Payload: Sized + Clone + Debug + PartialEq {
 }
 
 /// Errors from encoding, decoding, sealing and opening entry memos.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MemoError {
     #[error("memo is {0} bytes, longer than the 512-byte memo field")]
     TooLong(usize),
