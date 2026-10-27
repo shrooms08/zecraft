@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = ["crates/zecraft-core", "crates/zecraft-vault", "crates/zecraft-engine", "crates/zecraft-player", "crates/zecraft-keyholder", "crates/zecraft-verify"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shrooms08/zecraft"
+
+[workspace.dependencies]
+# FROST (threshold Schnorr) and the RedPallas ciphersuite.
+frost-core = { version = "3.0.0", features = ["serialization"] }
+frost-rerandomized = "3.0.0"
+reddsa = { version = "0.5.2", features = ["frost", "serde"] }
+
+# Zcash protocol and wallet stack (all aligned on orchard 0.15 / pasta_curves 0.5).
+orchard = { version = "0.15.5", default-features = false, features = ["circuit", "multicore", "std"] }
+pasta_curves = "0.5"
+pczt = { version = "0.9.3", features = ["orchard", "signer", "prover", "tx-extractor", "io-finalizer", "spend-finalizer", "zcp-builder"] }
+zcash_address = "0.13.0"
+zcash_client_backend = { version = "0.24.0", features = ["orchard", "pczt", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.22.0", features = ["orchard", "serde", "transparent-inputs"] }
+zcash_keys = { version = "0.16.1", features = ["orchard", "unstable-frost"] }
+zcash_primitives = "0.30.1"
+zcash_protocol = "0.10.5"
+zip321 = "0.9"
+zip32 = "0.2"
+
+# Keyholder identity and wire encoding.
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+postcard = { version = "1.1", features = ["use-std"] }
+
+# Crypto plumbing.
+group = "0.13"
+ff = "0.13"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1.8"
+secrecy = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Networking / async.
+tonic = { version = "0.14", features = ["tls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["json", "ws"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
+
+# zecraft-core cryptography (pure Rust, builds on wasm32-unknown-unknown).
+# hpke 0.14 needs sha2 0.11, which the pinned zcash_client_backend (via bip32)
+# locks to a pre-release, so the 0.13 line (sha2 0.10, rand_core 0.9) is used.
+hpke = { version = "0.13.0", default-features = false, features = ["alloc", "x25519"] }
+rand_core_09 = { package = "rand_core", version = "0.9" }
+rand_09 = { package = "rand", version = "0.9", default-features = false, features = ["std_rng", "os_rng"] }
+rand_08 = { package = "rand", version = "0.8", default-features = false, features = ["std_rng"] }
+drand_verify = { package = "drand-verify", version = "0.6.2", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# Serialization and utilities.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+
+# halo2 proving/keygen is unusably slow unoptimised; optimise dependencies even in dev/test
+# builds while keeping our own crate quick to compile.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Testnet activated NU7 (consensus branch 0x77190AD9) at height 4,465,026, which the
+# published 0.10.x `zcash_protocol` only knows as a placeholder behind the
+# `zcash_unstable = "nu7"` cfg. `vendor/zcash_protocol` is the unmodified 0.10.6
+# source plus the two NU7 constants that 0.11.0-pre.0 ships; see
+# vendor/zcash_protocol/ZEEK-PATCH.md. The cfg itself is set in .cargo/config.toml.
+[patch.crates-io]
+zcash_protocol = { path = "vendor/zcash_protocol" }

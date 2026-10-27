@@ -1,0 +1,51 @@
+[package]
+name = "zecraft-player"
+version = "0.1.0"
+description = "Zeek test player: single-key shielded testnet wallets that dig on the board"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "zecraft-player"
+path = "src/main.rs"
+
+[dependencies]
+zecraft-core = { path = "../zecraft-core" }
+zecraft-vault = { path = "../zecraft-vault" }
+zecraft-verify = { path = "../zecraft-verify" }
+base64.workspace = true
+
+orchard.workspace = true
+zcash_note_encryption = "0.4.1"
+zcash_primitives.workspace = true
+pczt.workspace = true
+zcash_client_backend.workspace = true
+zcash_client_sqlite.workspace = true
+zcash_keys.workspace = true
+zcash_protocol.workspace = true
+zip321.workspace = true
+zcash_address.workspace = true
+zip32.workspace = true
+secrecy.workspace = true
+rand_core.workspace = true
+rand_09.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }

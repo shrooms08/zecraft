@@ -1,0 +1,810 @@
+//! End-to-end: a recorded (synthetic) chain with digs flows through
+//! ingestion, timing rule, beacon verification and settlement without any
+//! network, and the result is reproducible, verifiable and private.
+
+use zecraft_core::digs::RefundReason;
+use zecraft_core::rounds::RoundStatus;
+use zecraft_core::settle::{PayoutReason, RoundOutcome};
+use zecraft_engine::api::{config_response, proof_response, round_response};
+use zecraft_engine::chain::ingest;
+use zecraft_engine::config::SETTLE_CONFIRMATIONS;
+use zecraft_engine::db::Pool;
+use zecraft_engine::decrypt::DigScanner;
+use zecraft_engine::processor::{Event, Processor};
+use zecraft_engine::proof;
+use zecraft_engine::store::Store;
+use zecraft_engine::synthetic::{SyntheticChain, TestVault};
+
+mod common;
+use common::{fixture_beacons, scenario, start_time, Scenario, FIXTURE_ROUND, GENESIS};
+
+#[tokio::test]
+async fn round_is_ingested_settled_served_and_reproducible() {
+    let Scenario { vault, mut chain } = scenario(0);
+    let config = vault.config(GENESIS);
+    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let store = Store::open_in_memory().expect("db");
+    let mut processor = Processor::new(config.clone());
+    let mut beacons = fixture_beacons();
+
+    let report = ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    assert_eq!(
+        report.new_notes, 6,
+        "payments to the external address, never change"
+    );
+
+    // Before the beacon is published nothing settles.
+    let (_, _, _) = processor
+        .status(&store.reader().expect("reader"), 0)
+        .expect("status");
+    let beacon_time = start_time(&config.params) + 600 + 900;
+    let events = processor
+        .process(&store, &mut beacons, beacon_time - 1)
+        .await
+        .expect("process");
+    assert!(events.is_empty());
+    let pending = processor
+        .pending_rounds(&store.reader().expect("reader"))
+        .expect("pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].drand_round, FIXTURE_ROUND);
+    assert_eq!(pending[0].beacon_time, beacon_time);
+    assert_eq!(pending[0].status, RoundStatus::Revealable);
+
+    // Once published, the round settles.
+    let events = processor
+        .process(&store, &mut beacons, beacon_time + 5)
+        .await
+        .expect("process");
+    assert!(matches!(
+        events[0],
+        Event::Reveal {
+            round: 0,
+            drand_round: FIXTURE_ROUND,
+            ..
+        }
+    ));
+    assert!(matches!(events[1], Event::Settled { round: 0, .. }));
+    let row = store
+        .read(|db| db.settlement(0))
+        .expect("row")
+        .expect("settled");
+    let RoundOutcome::Drawn {
+        treasure_tile,
+        cache_triggered,
+    } = row.outcome
+    else {
+        panic!("expected a drawn round");
+    };
+    let s = &row.settlement;
+    assert_eq!(row.rules_version, 2);
+    assert_eq!(
+        s.pot,
+        1_200_000 - 3 * 5_000,
+        "three dig fees come off first"
+    );
+    assert_eq!(s.rake, 59_250);
+    assert_eq!(s.forfeited, 200_000, "dust dig and text memo");
+    assert_eq!(
+        s.dig_fees,
+        4 * 5_000,
+        "three valid digs and the paid refund"
+    );
+    let refunds: Vec<_> = s
+        .payouts
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.reason,
+                PayoutReason::Refund(RefundReason::WrongRound { memo_round: 7 })
+            )
+        })
+        .collect();
+    assert_eq!(refunds.len(), 1);
+    assert_eq!(refunds[0].net, 200_000 - 5_000 - 5_000);
+    // The payout transaction must spend exactly the four charged notes.
+    let inputs = processor
+        .payout_inputs(&store.reader().expect("reader"), &row)
+        .expect("inputs");
+    assert_eq!(inputs.len(), 4);
+    assert!(inputs.iter().all(|n| n.value >= 200_000));
+    assert!(inputs
+        .windows(2)
+        .all(|w| (w[0].height, &w[0].txid, w[0].output_index)
+            <= (w[1].height, &w[1].txid, w[1].output_index)));
+    let winners = s
+        .payouts
+        .iter()
+        .filter(|p| matches!(p.reason, PayoutReason::Win { .. }))
+        .count();
+    match treasure_tile {
+        3 => assert_eq!(winners, 2),
+        17 => assert_eq!(winners, 1),
+        _ => assert_eq!(winners, 0),
+    }
+    if !cache_triggered {
+        assert_eq!(s.cache_paid, 0);
+    }
+
+    // API views.
+    let config_view = config_response(&config, true, false);
+    assert_eq!(config_view.genesis_height, GENESIS);
+    assert_eq!(
+        config_view.vault_address.as_deref(),
+        Some(config.vault_address.as_str())
+    );
+    // Readiness mode (digging off) withholds everything a payment needs.
+    let closed = config_response(&config, false, false);
+    assert!(!closed.digging_enabled);
+    assert!(
+        closed.vault_address.is_none()
+            && closed.sealing_public_key.is_none()
+            && closed.uivk.is_none()
+    );
+    let json = serde_json::to_string(&closed).expect("json");
+    assert!(
+        !json.contains(&config.vault_address),
+        "the address never appears"
+    );
+    let round_view =
+        round_response(&processor, &store.reader().expect("reader"), 0).expect("round view");
+    assert_eq!(round_view.status, RoundStatus::Settled);
+    let settled = round_view.settled.as_ref().expect("settled view");
+    assert_eq!(settled.rules_version, 2);
+    assert_eq!(settled.dig_fees, 20_000);
+    assert_eq!(settled.tile_totals[3], 800_000);
+    assert_eq!(settled.tile_totals[17], 400_000);
+    assert_eq!(settled.treasure_tile, Some(treasure_tile));
+    assert_eq!(settled.payouts, s.payouts);
+    let board = processor
+        .board(&store.reader().expect("reader"))
+        .expect("board");
+    assert_eq!(board.round, 1, "the tip is in round 1 now");
+    assert_eq!(board.cache, s.new_cache);
+    let pending = processor
+        .pending_rounds(&store.reader().expect("reader"))
+        .expect("pending");
+    assert!(pending.is_empty());
+
+    // Proof bundle recomputes to the identical settlement with zecraft-core only.
+    let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
+        .expect("proof")
+        .expect("settled");
+    let recomputed = proof::recompute(&bundle).expect("recompute");
+    assert_eq!(
+        serde_json::to_string(&recomputed).expect("json"),
+        serde_json::to_string(&bundle.settlement).expect("json")
+    );
+    assert!(
+        proof_response(&processor, &store.reader().expect("reader"), 1)
+            .expect("proof")
+            .is_none()
+    );
+
+    // Privacy: no API output contains an opened payout receiver (the players'
+    // receivers are [player; 43]); the sealed bytes are there instead.
+    let mut all_json = String::new();
+    for text in [
+        serde_json::to_string(&config_view).expect("json"),
+        serde_json::to_string(&round_view).expect("json"),
+        serde_json::to_string(&board).expect("json"),
+        serde_json::to_string(&bundle).expect("json"),
+        serde_json::to_string(&events).expect("json"),
+    ] {
+        all_json.push_str(&text);
+    }
+    for player in 1u8..=4 {
+        let opened = hex::encode([player; 43]);
+        assert!(
+            !all_json.contains(&opened),
+            "opened receiver of player {player} leaked"
+        );
+    }
+    let first_sealed = hex::encode(s.payouts[0].sealed_receiver.as_bytes());
+    assert!(all_json.contains(&first_sealed));
+    // The engine never needed the sealing private key; a holder of it can open.
+    let opened = vault
+        .dig_memo(0, 3, 1)
+        .open(zecraft_core::params::Network::Test, &vault.sealing_private)
+        .expect("open");
+    assert_eq!(opened.orchard, [1u8; 43]);
+
+    // Idempotent restart: a fresh processor over the same database adds nothing,
+    // and a fresh database over the same chain reproduces the state byte for byte.
+    let dump = store.read(|db| db.dump()).expect("dump");
+    let mut restarted = Processor::new(config.clone());
+    let events = restarted
+        .process(&store, &mut beacons, beacon_time + 1_000)
+        .await
+        .expect("process");
+    assert!(events.is_empty());
+    let again = ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    assert_eq!(again.new_blocks, 0);
+    assert_eq!(store.read(|db| db.dump()).expect("dump"), dump);
+
+    let fresh = Store::open_in_memory().expect("db");
+    ingest(&mut chain, &fresh, &scanner, &config)
+        .await
+        .expect("ingest");
+    let mut fresh_processor = Processor::new(config.clone());
+    fresh_processor
+        .process(&fresh, &mut fixture_beacons(), beacon_time + 5)
+        .await
+        .expect("process");
+    assert_eq!(fresh.read(|db| db.dump()).expect("dump"), dump);
+}
+
+#[tokio::test]
+async fn cache_carry_over_is_the_first_previous_cache() {
+    let Scenario { vault, mut chain } = scenario(0);
+    let mut config = vault.config(GENESIS);
+    config.initial_cache_zat = 777_000;
+    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let store = Store::open_in_memory().expect("db");
+    let mut processor = Processor::new(config.clone());
+    assert_eq!(
+        processor
+            .cache_balance(&store.reader().expect("reader"))
+            .expect("cache"),
+        777_000
+    );
+    assert_eq!(
+        config_response(&config, true, false).initial_cache_zat,
+        777_000
+    );
+    ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    let beacon_time = start_time(&config.params) + 600 + 900;
+    processor
+        .process(&store, &mut fixture_beacons(), beacon_time + 5)
+        .await
+        .expect("process");
+    let row = store
+        .read(|db| db.settlement(0))
+        .expect("row")
+        .expect("settled");
+    assert_eq!(row.settlement.previous_cache, 777_000);
+    assert!(
+        row.settlement.new_cache >= 777_000 + 59_250,
+        "rake lands on top of the carry-over"
+    );
+    let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
+        .expect("proof")
+        .expect("settled");
+    assert_eq!(
+        proof::recompute(&bundle).expect("recompute"),
+        bundle.settlement
+    );
+}
+
+#[tokio::test]
+async fn late_window_is_voided_and_refunded() {
+    // The window closes 20 minutes late: the post-close median lands after
+    // the beacon, so the timing rule voids the round.
+    let Scenario { vault, mut chain } = scenario(1_200);
+    let config = vault.config(GENESIS);
+    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let store = Store::open_in_memory().expect("db");
+    let mut processor = Processor::new(config.clone());
+    let mut beacons = fixture_beacons();
+    ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    let (_, status, _) = processor
+        .status(&store.reader().expect("reader"), 0)
+        .expect("status");
+    assert_eq!(status, RoundStatus::Voided);
+
+    let events = processor
+        .process(&store, &mut beacons, 0)
+        .await
+        .expect("process");
+    assert!(matches!(
+        events[0],
+        Event::Settled {
+            round: 0,
+            outcome: RoundOutcome::Voided,
+            ..
+        }
+    ));
+    let row = store
+        .read(|db| db.settlement(0))
+        .expect("row")
+        .expect("settled");
+    assert_eq!(row.settlement.rake, 0);
+    assert!(row
+        .settlement
+        .payouts
+        .iter()
+        .all(|p| matches!(p.reason, PayoutReason::Refund(_))));
+    assert_eq!(
+        row.settlement.payouts.len(),
+        4,
+        "three valid digs and the wrong-round dig"
+    );
+    assert_eq!(
+        row.settlement.new_cache, 200_000,
+        "forfeits still feed the cache"
+    );
+    let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
+        .expect("proof")
+        .expect("settled");
+    assert!(bundle.beacon.is_none());
+    let recomputed = proof::recompute(&bundle).expect("recompute");
+    assert_eq!(recomputed, bundle.settlement);
+}
+
+/// The HTTP layer serves the same views, and 404s unsettled proofs.
+#[tokio::test]
+async fn http_api_serves_the_round() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
+    use zecraft_engine::api::{router, AppState, HealthResponse, PendingResponse, RoundResponse};
+    use zecraft_engine::proof::ProofBundle;
+
+    let Scenario { vault, mut chain } = scenario(0);
+    let config = vault.config(GENESIS);
+    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let store = Store::open_in_memory().expect("db");
+    let mut processor = Processor::new(config.clone());
+    ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    let beacon_time = start_time(&config.params) + 600 + 900;
+    processor
+        .process(&store, &mut fixture_beacons(), beacon_time + 5)
+        .await
+        .expect("process");
+    let (events, _) = broadcast::channel(8);
+    let state = Arc::new(AppState {
+        processor,
+        store: Arc::new(store),
+        events,
+        started: std::time::Instant::now(),
+        ledger: None,
+        chain_servers: None,
+        digging: true,
+        demo_digs: false,
+        stream_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            zecraft_engine::api::MAX_STREAMS,
+        )),
+        relay: None,
+        proof_limiter: zecraft_engine::relay::RateLimiter::new(10),
+        keyholder_ids: vec![1, 2, 3],
+        threshold: 2,
+    });
+    let app = router(state, &["http://localhost:7173".to_owned()]);
+
+    async fn get(app: &axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec();
+        (status, body)
+    }
+
+    let (status, body) = get(&app, "/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    let health: HealthResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(health.settled_rounds, 1);
+
+    let (status, body) = get(&app, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let view: zecraft_engine::api::StatusResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(view.engine.last_settled_round, Some(0));
+    assert_eq!(view.engine.stored_tip, health.tip_height);
+    assert!(view.engine.last_block_time.is_some());
+    assert_eq!(
+        view.keyholders.len(),
+        3,
+        "configured keyholders listed even before a probe"
+    );
+    assert!(view.keyholders.iter().all(|k| k.reachable.is_none()));
+    assert!(view.digging_enabled);
+
+    let (status, body) = get(&app, "/v1/rounds/0").await;
+    assert_eq!(status, StatusCode::OK);
+    let round: RoundResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(round.status, RoundStatus::Settled);
+    assert!(round.settled.is_some());
+
+    let (status, body) = get(&app, "/v1/rounds/0/proof").await;
+    assert_eq!(status, StatusCode::OK);
+    let bundle: ProofBundle = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        proof::recompute(&bundle).expect("recompute"),
+        bundle.settlement
+    );
+    for player in 1u8..=4 {
+        assert!(!String::from_utf8_lossy(&body).contains(&hex::encode([player; 43])));
+    }
+
+    let (status, _) = get(&app, "/v1/rounds/1/proof").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = get(&app, "/v1/rounds/pending").await;
+    assert_eq!(status, StatusCode::OK);
+    let pending: PendingResponse = serde_json::from_slice(&body).expect("json");
+    assert!(pending.rounds.is_empty());
+
+    let (status, _) = get(&app, "/v1/board").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get(&app, "/v1/config").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Phase 7a: past rounds, memo digests, keyholder status.
+    let (status, body) = get(&app, "/v1/rounds").await;
+    assert_eq!(status, StatusCode::OK);
+    let rounds: zecraft_engine::api::RoundsResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(rounds.rounds.len(), 1, "round 0 had digs");
+    assert_eq!(rounds.rounds[0].round, 0);
+    assert!(["paying", "no_winner", "paid"].contains(&rounds.rounds[0].status.as_str()));
+    for player in 1u8..=4 {
+        assert!(!String::from_utf8_lossy(&body).contains(&hex::encode([player; 43])));
+    }
+    let (status, body) = get(&app, "/v1/rounds/0/digests").await;
+    assert_eq!(status, StatusCode::OK);
+    let digests: zecraft_engine::api::DigestsResponse = serde_json::from_slice(&body).expect("json");
+    assert!(!digests.notes.is_empty());
+    assert!(digests.notes.iter().all(|n| n.memo_sha256.len() == 64));
+    let (status, body) = get(&app, "/v1/keyholders/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: zecraft_engine::api::KeyholdersResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(keys.threshold, 2);
+    assert_eq!(keys.keyholders.len(), 3);
+    assert_eq!(keys.keyholders[0].label, "Keyholder A");
+    assert_eq!(
+        keys.keyholders[0].reachable, None,
+        "never probed in this test"
+    );
+}
+
+/// Rules v3: from the activation height a dig may carry the `zeek1:` text
+/// memo. The same chain settles differently before and after activation, the
+/// board reports the prize pool next to the gross total, and the version 3
+/// proof bundle recomputes.
+#[tokio::test]
+async fn text_memo_digs_count_from_the_activation_height() {
+    let vault = TestVault::new(77);
+    let base = vault.config(GENESIS);
+    let mut chain = SyntheticChain::new(&vault, GENESIS, start_time(&base.params));
+    chain.push_block(vec![]); // GENESIS
+    let text_memo = |tile: u8, player: u8| {
+        let text = vault.dig_memo(0, tile, player).encode_text();
+        let mut field = [0u8; 512];
+        field[..text.len()].copy_from_slice(text.as_bytes());
+        field
+    };
+    // GENESIS + 1: a text dig before activation; GENESIS + 2: one after it,
+    // next to a binary dig.
+    chain.push_block(vec![chain.payment(
+        300_000,
+        Pool::Ironwood,
+        text_memo(4, 1),
+    )]);
+    chain.push_block(vec![
+        chain.payment(200_000, Pool::Ironwood, text_memo(5, 2)),
+        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 6, 3).encode()),
+    ]);
+    while chain.next_height() < GENESIS + base.params.blocks_per_round {
+        chain.advance(1);
+    }
+    chain.advance(base.params.mtp_window + SETTLE_CONFIRMATIONS);
+    let beacon_time = start_time(&base.params) + 600 + 900;
+
+    let mut v3 = base.clone();
+    v3.params.text_memo_activation_height = Some(GENESIS + 2);
+    v3.validate().expect("valid config");
+    for (config, expected_version, valid_digs, forfeited) in
+        [(base, 2u32, 1usize, 500_000u64), (v3, 3, 2, 300_000)]
+    {
+        let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+        let store = Store::open_in_memory().expect("db");
+        let mut processor = Processor::new(config.clone());
+        ingest(&mut chain, &store, &scanner, &config)
+            .await
+            .expect("ingest");
+        processor
+            .process(&store, &mut fixture_beacons(), beacon_time + 5)
+            .await
+            .expect("process");
+        let row = store
+            .read(|db| db.settlement(0))
+            .expect("row")
+            .expect("settled");
+        assert_eq!(row.rules_version, expected_version);
+        assert_eq!(row.settlement.forfeited, forfeited);
+        let gross: u64 = if valid_digs == 2 { 300_000 } else { 100_000 };
+        assert_eq!(row.settlement.pot, gross - valid_digs as u64 * 5_000);
+        let view = round_response(&processor, &store.reader().expect("reader"), 0).expect("view");
+        assert_eq!(view.digs, valid_digs);
+        let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
+            .expect("proof")
+            .expect("settled");
+        assert_eq!(bundle.version, proof::PROOF_VERSION);
+        assert_eq!(bundle.rules_version, Some(expected_version));
+        assert_eq!(bundle.claimed_rules_version(), Some(expected_version));
+        assert_eq!(
+            bundle.params.text_memo_activation_height.is_some(),
+            expected_version == 3
+        );
+        assert_eq!(
+            proof::recompute(&bundle).expect("recompute"),
+            bundle.settlement
+        );
+    }
+}
+
+/// The board labels the prize pool (net of dig fees and rake) and the gross
+/// total separately while a round is open.
+#[tokio::test]
+async fn board_reports_prize_pool_and_gross_total() {
+    let vault = TestVault::new(78);
+    let config = vault.config(GENESIS);
+    let mut chain = SyntheticChain::new(&vault, GENESIS, start_time(&config.params));
+    chain.push_block(vec![
+        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 1, 1).encode()),
+        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 2, 2).encode()),
+    ]);
+    chain.advance(2);
+    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let store = Store::open_in_memory().expect("db");
+    let processor = Processor::new(config.clone());
+    ingest(&mut chain, &store, &scanner, &config)
+        .await
+        .expect("ingest");
+    let board = processor
+        .board(&store.reader().expect("reader"))
+        .expect("board");
+    assert_eq!(board.round, 0);
+    assert_eq!(board.digs, 2);
+    assert_eq!(board.gross_dug_zat, 200_000);
+    assert_eq!(board.prize_pool_zat, 180_500, "(200,000 - 2 x 5,000) x 95%");
+    assert_eq!(board.rules_version, 2);
+    let json = serde_json::to_string(&board).expect("json");
+    assert!(json.contains("\"prize_pool_zat\":180500"));
+    assert!(json.contains("\"gross_dug_zat\":200000"));
+}
+
+/// The relay serves tip, length-prefixed compact blocks, transactions and
+/// broadcasts over HTTP, caps the block range and the body size, and rate
+/// limits.
+#[tokio::test]
+async fn relay_serves_chain_data_with_limits() {
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use prost::Message;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+    use zcash_client_backend::proto::compact_formats::CompactBlock;
+    use zcash_client_backend::proto::service::{RawTransaction, TreeState};
+    use zecraft_engine::chain::ChainSource;
+    use zecraft_engine::relay::{
+        self, RelayBackend, RelayError, RelayState, RelayStatsResponse, TipResponse,
+        MAX_BLOCK_RANGE, MAX_TX_BYTES,
+    };
+
+    struct Synthetic {
+        chain: Mutex<SyntheticChain>,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl RelayBackend for Synthetic {
+        async fn tip(&self) -> Result<(u32, String), RelayError> {
+            let mut chain = self.chain.lock().await;
+            let height = chain
+                .latest_height()
+                .await
+                .map_err(|e| RelayError::Upstream(e.to_string()))?;
+            let hash = chain
+                .block(height)
+                .map(|b| b.hash.clone())
+                .unwrap_or_default();
+            Ok((height, hex::encode(hash)))
+        }
+        async fn blocks(&self, start: u32, end: u32) -> Result<Vec<CompactBlock>, RelayError> {
+            self.chain
+                .lock()
+                .await
+                .block_range(start, end)
+                .await
+                .map_err(|e| RelayError::Upstream(e.to_string()))
+        }
+        async fn tree_state(&self, height: u32) -> Result<TreeState, RelayError> {
+            Ok(TreeState {
+                height: u64::from(height),
+                ..TreeState::default()
+            })
+        }
+        async fn broadcast(&self, raw: Vec<u8>) -> Result<(), RelayError> {
+            if raw == b"bad" {
+                return Err(RelayError::Rejected("bad-txns".into()));
+            }
+            self.sent.lock().await.push(raw);
+            Ok(())
+        }
+        async fn transaction(&self, txid: [u8; 32]) -> Result<RawTransaction, RelayError> {
+            self.chain
+                .lock()
+                .await
+                .transaction(&txid[..])
+                .map(|data| RawTransaction { data, height: 7 })
+                .ok_or(RelayError::NotFound)
+        }
+    }
+
+    let vault = TestVault::new(5);
+    let mut chain = SyntheticChain::new(&vault, 100, 1_700_000_000);
+    chain.advance(3);
+    chain.push_block(vec![chain.payment(100_000, Pool::Ironwood, [0xF6; 512])]); // 103
+    chain.advance(2);
+    let txid_internal: [u8; 32] = chain.block(103).expect("block").vtx[0]
+        .txid
+        .clone()
+        .try_into()
+        .expect("32 bytes");
+    let mut display = txid_internal;
+    display.reverse();
+    let backend = Arc::new(Synthetic {
+        chain: Mutex::new(chain),
+        sent: Mutex::new(Vec::new()),
+    });
+    struct Shared(Arc<Synthetic>);
+    #[async_trait]
+    impl RelayBackend for Shared {
+        async fn tip(&self) -> Result<(u32, String), RelayError> {
+            self.0.tip().await
+        }
+        async fn blocks(&self, s: u32, e: u32) -> Result<Vec<CompactBlock>, RelayError> {
+            self.0.blocks(s, e).await
+        }
+        async fn tree_state(&self, h: u32) -> Result<TreeState, RelayError> {
+            self.0.tree_state(h).await
+        }
+        async fn broadcast(&self, raw: Vec<u8>) -> Result<(), RelayError> {
+            self.0.broadcast(raw).await
+        }
+        async fn transaction(&self, t: [u8; 32]) -> Result<RawTransaction, RelayError> {
+            self.0.transaction(t).await
+        }
+    }
+    let app = relay::router(Arc::new(RelayState::new(
+        Box::new(Shared(backend.clone())),
+        12,
+    )));
+
+    async fn call(app: &axum::Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec();
+        (status, body)
+    }
+    let get = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("request")
+    };
+    let post = |body: Vec<u8>| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/tx/broadcast")
+            .body(Body::from(body))
+            .expect("request")
+    };
+
+    let (status, body) = call(&app, get("/v1/chain/tip")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tip: TipResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(tip.height, 105);
+
+    let (status, body) = call(&app, get("/v1/chain/blocks?start=102&end=104")).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut rest = body.as_slice();
+    let mut heights = Vec::new();
+    let mut outputs = 0;
+    while !rest.is_empty() {
+        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let block = CompactBlock::decode(&rest[4..4 + len]).expect("decode");
+        heights.push(block.height);
+        outputs += block
+            .vtx
+            .iter()
+            .map(|t| t.ironwood_actions.len())
+            .sum::<usize>();
+        rest = &rest[4 + len..];
+    }
+    assert_eq!(heights, vec![102, 103, 104]);
+    assert!(
+        outputs >= 1,
+        "all compact outputs are relayed, not a filtered view"
+    );
+
+    let too_many = format!("/v1/chain/blocks?start=0&end={MAX_BLOCK_RANGE}");
+    assert_eq!(call(&app, get(&too_many)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        call(&app, get("/v1/chain/blocks?start=5&end=4")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let (status, body) = call(&app, get("/v1/chain/tree-state?height=103")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        TreeState::decode(body.as_slice()).expect("decode").height,
+        103
+    );
+
+    let (status, body) = call(&app, get(&format!("/v1/tx/{}", hex::encode(display)))).await;
+    assert_eq!(status, StatusCode::OK);
+    let raw = RawTransaction::decode(body.as_slice()).expect("decode");
+    assert_eq!(raw.height, 7);
+    assert!(!raw.data.is_empty());
+    assert_eq!(
+        call(&app, get(&format!("/v1/tx/{}", "00".repeat(32))))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&app, get("/v1/tx/nothex")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
+    assert_eq!(call(&app, post(vec![1, 2, 3])).await.0, StatusCode::OK);
+    assert_eq!(backend.sent.lock().await.as_slice(), &[vec![1, 2, 3]]);
+    assert_eq!(
+        call(&app, post(b"bad".to_vec())).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(&app, post(vec![0; MAX_TX_BYTES + 1])).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    // 12 requests per minute: the bucket is empty by now.
+    let mut limited = 0;
+    for _ in 0..6 {
+        if call(&app, get("/v1/chain/tip")).await.0 == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    assert!(limited >= 4, "rate limit engaged ({limited})");
+    let stats_app = relay::router(Arc::new(RelayState::new(Box::new(Shared(backend)), 600)));
+    let (_, body) = call(&stats_app, get("/v1/relay/stats")).await;
+    let stats: RelayStatsResponse = serde_json::from_slice(&body).expect("json");
+    assert_eq!(stats.rate_per_minute, 600);
+    assert_eq!(stats.max_block_range, MAX_BLOCK_RANGE);
+}

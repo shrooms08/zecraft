@@ -1,0 +1,28 @@
+{
+  "identifier": 2,
+  "threshold": 2,
+  "signers": 3,
+  "bind": "[::]:7702",
+  "data_dir": "/data/data",
+  "secrets_dir": "/data/secrets",
+  "game_config": "/app/game.json",
+  "lightwalletd": [
+    "https://zaino.testnet.unsafe.zec.rocks:443",
+    "https://testnet.zec.rocks:443"
+  ],
+  "peers": [
+    {
+      "identifier": 1,
+      "url": "http://keyholder-1.railway.internal:7701",
+      "identity": "REPLACE_AFTER_DKG_keyholder_1_identity"
+    },
+    {
+      "identifier": 3,
+      "url": "http://keyholder-3.railway.internal:7703",
+      "identity": "REPLACE_AFTER_DKG_keyholder_3_identity"
+    }
+  ],
+  "coordinator_identity": "REPLACE_AFTER_DKG_coordinator_identity",
+  "poll_secs": 10,
+  "dkg": false
+}
