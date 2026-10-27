@@ -8,8 +8,8 @@ import { PrivacyNote } from "./components/PrivacyNote";
 import { RaffleSection } from "./components/RaffleSection";
 import { WriteYourGame } from "./components/WriteYourGame";
 
-/** Placeholder until the repository is public. */
-export const GITHUB_URL = "https://github.com/zecraft/zecraft";
+/** The public repository. */
+export const GITHUB_URL = "https://github.com/shrooms08/zecraft";
 const REFRESH_MS = 10_000;
 
 export function App() {
