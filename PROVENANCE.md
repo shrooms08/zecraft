@@ -161,7 +161,8 @@ default data dirs, proxy header names) and the removal of Zeek-only modules.
 
 ## Written new in Zecraft (not from Zeek)
 
-`.gitignore`, `PROVENANCE.md`, `games/raffle/rules/README.md`, `games/raffle/web/README.md`.
+`.gitignore`, `PROVENANCE.md`, `games/raffle/rules/README.md`, `games/raffle/web/README.md`,
+`crates/zecraft-player/src/shield.rs` (faucet funding: transparent address and shielding into Ironwood).
 ## Removed in Phase A
 
 | Zeek file | Why |

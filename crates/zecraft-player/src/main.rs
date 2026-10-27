@@ -5,6 +5,7 @@ const NETWORK: zecraft_vault::Params = zecraft_vault::Params::TestNetwork;
 
 mod dig;
 mod notes;
+mod shield;
 mod wallet;
 
 use anyhow::Context;
@@ -29,12 +30,21 @@ enum Command {
     Init { name: String },
     /// Print the player's unified address (Orchard receiver). With --fresh,
     /// a new diversified address the wallet records as exposed (for pasting
-    /// as an any-wallet payout address).
+    /// as an any-wallet payout address). With --transparent, the player's
+    /// transparent address, for wallets that cannot pay an Orchard-only
+    /// address (such as the testnet faucet); move the funds into Ironwood
+    /// afterwards with `shield`.
     Address {
         name: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "transparent")]
         fresh: bool,
+        #[arg(long)]
+        transparent: bool,
     },
+    /// Shield every UTXO of the player's transparent address into its
+    /// Ironwood balance in one transaction (ZIP 317 fee: 0.0001 ZEC for a
+    /// single faucet payment).
+    Shield { name: String },
     /// Scan testnet for the player's notes.
     Sync { name: String },
     /// Show the player's Ironwood balance.
@@ -123,12 +133,26 @@ fn main() -> anyhow::Result<()> {
             println!("Created player `{name}`; address: {}", player.address()?);
             Ok(())
         }
-        Command::Address { name, fresh: false } => {
+        Command::Address {
+            name,
+            transparent: true,
+            ..
+        } => {
+            let player = Player::new(secrets.path(), &name)?;
+            let address = shield::transparent_address(&player.spending_key()?)?;
+            println!("{}", shield::encode_transparent(address));
+            Ok(())
+        }
+        Command::Address {
+            name, fresh: false, ..
+        } => {
             let player = Player::new(secrets.path(), &name)?;
             println!("{}", player.address()?);
             Ok(())
         }
-        Command::Address { name, fresh: true } => {
+        Command::Address {
+            name, fresh: true, ..
+        } => {
             let player = Player::new(secrets.path(), &name)?;
             let mut db = player.open_db()?;
             let account = player
@@ -217,6 +241,19 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "Sent {} zatoshis (fee {})",
                 outcome.total_zat, outcome.fee_zat
+            );
+            println!("txid: {}", outcome.txid);
+            Ok(())
+        }),
+        Command::Shield { name } => runtime.block_on(async {
+            let player = Player::new(secrets.path(), &name)?;
+            let mut client = config.connect(zecraft_core::params::Network::Test).await?;
+            let mut db = player.open_db()?;
+            player.ensure_account(&mut db, &mut client).await?;
+            let outcome = shield::shield(&player, &mut db, &mut client).await?;
+            println!(
+                "Shielded {} transparent input(s) into Ironwood: {} zatoshis (fee {})",
+                outcome.inputs, outcome.shielded_zat, outcome.fee_zat
             );
             println!("txid: {}", outcome.txid);
             Ok(())

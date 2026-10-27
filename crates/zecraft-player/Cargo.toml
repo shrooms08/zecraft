@@ -27,6 +27,9 @@ zcash_keys.workspace = true
 zcash_protocol.workspace = true
 zip321.workspace = true
 zcash_address.workspace = true
+# Transparent keys for faucet funding (`address --transparent`, `shield`); the
+# version already locked through zcash_keys.
+transparent = { package = "zcash_transparent", version = "0.10.0" }
 zip32.workspace = true
 secrecy.workspace = true
 rand_core.workspace = true

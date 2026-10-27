@@ -4694,6 +4694,7 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_protocol",
+ "zcash_transparent",
  "zecraft-core",
  "zecraft-vault",
  "zecraft-verify",
