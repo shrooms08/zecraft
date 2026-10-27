@@ -1,0 +1,36 @@
+# zecraft-raffle-verify round 0, 2026-10-27T10:55:14Z
+# Against the independent zaino endpoint (as specified):
+#   zecraft-raffle-verify round 0 --engine http://127.0.0.1:7787 --lightwalletd https://zaino.testnet.unsafe.zec.rocks:443
+#   -> Error: HTTP 503 Service Unavailable (zaino has been down; no other public testnet lightwalletd answers)
+# Then against testnet.zec.rocks directly (the same upstream the engine uses):
+#   zecraft-raffle-verify round 0 --engine http://127.0.0.1:7787 --lightwalletd https://testnet.zec.rocks:443
+
+lightwalletd https://testnet.zec.rocks:443: chain test at height 4547202 (ECC LightWalletD v0.5.4)
+Round 0 (bundle format 1)
+Chain source: https://testnet.zec.rocks:443 (blocks 4547139..=4547173, 4 transactions)
+
+1. [PASS] Randomness beacon
+   drand quicknet round 33431631 is genuine and is the one the rules bind; check 4 recomputes the draw from it.
+   - round start block 4547139 nTime 1793096755
+   - BLS signature verified against the quicknet public key
+
+2. [PASS] Entries complete and correct
+   All 3 payments the vault received in blocks 4547139..4547162 are in the bundle, with the same amounts and memos; none is missing or made up.
+   - 24 blocks trial-decrypted with the public UIVK; 600000 zatoshis in total
+
+3. [PASS] Timing rule
+   The round closed safely before the beacon was published, so nobody could know the outcome while entering.
+   - median time past of blocks 4547163..4547173: 1793097450; beacon published at 1793098257; clock skew allowance 300 s
+
+4. [PASS] Settlement
+   Recomputing the round from its entries gives exactly the published result: 580000 paid in 1 output(s), carry 0 → 0.
+   - received 600000, fees 20000, outcome {"tickets_sold":6,"winner":{"entry_index":0,"first_ticket":2,"output_index":0,"tickets":1,"txid":"acf3d4a632daa35037b75946bf4bc8c9f87e5f2909cb94d91fa0bc61dd558f92"},"winner_paid":true,"winning_ticket":2}
+   - conservation: received + carry_in = paid + fees + carry_out
+   - byte-for-byte equal (1007 bytes of JSON)
+
+5. [PASS] Payout transaction
+   The payout transaction is mined at block 4547201 and valid, and it pays every payable settled amount (1 output(s)).
+   - txid 2c3b07f1c2ea033f7c331a54ec9c49e5de9840a98141137923002154782e4922, 3 actions; Halo2 proof, spend authorization and binding signatures verified
+   - payout 0 (580000 zatoshis) is action 1: cmx 34a387af26bf2f856030ad2e23bd6dc17a36331af19edf1038a6b29efad2a310 recomputed
+
+Result: every available check passed
