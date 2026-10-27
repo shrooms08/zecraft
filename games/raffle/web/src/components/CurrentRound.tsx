@@ -33,7 +33,7 @@ export function CurrentRound({ board, spacing }: { board: Board | null; spacing:
           <dd>{g.entries}</dd>
         </div>
         <div>
-          <dt>Pot</dt>
+          <dt>{board.carry > 0 ? "Pot (incl. carry)" : "Pot"}</dt>
           <dd>{taz(g.pot_zat + board.carry)} TAZ</dd>
         </div>
         <div>

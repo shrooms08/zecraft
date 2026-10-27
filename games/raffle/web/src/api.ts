@@ -20,6 +20,8 @@ export interface Board {
   estimated_close_time: number;
   carry: number;
   entries: number;
+  /** Mean spacing of the last 20 blocks the engine stored (null until known). */
+  recent_spacing_secs: number | null;
   game: RaffleBoard;
 }
 

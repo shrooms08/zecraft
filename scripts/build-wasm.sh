@@ -20,4 +20,14 @@ env -u RUSTFLAGS cargo build -p zecraft-raffle-wasm --lib --release --target was
 out="$root/games/raffle/web/src/wasm"
 rm -rf "$out"
 wasm-bindgen target/wasm32-unknown-unknown/release/zecraft_raffle_wasm.wasm --target web --out-dir "$out"
+# Optional: binaryen's wasm-opt (the web package's devDependency, or WASM_OPT).
+# -O3, not -Oz: the in-browser Halo2 check is the slow part, keep it fast.
+opt="${WASM_OPT:-$root/games/raffle/web/node_modules/.bin/wasm-opt}"
+if [ -x "$opt" ]; then
+  "$opt" -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+    --enable-mutable-globals --enable-reference-types --enable-multivalue \
+    "$out/zecraft_raffle_wasm_bg.wasm" -o "$out/zecraft_raffle_wasm_bg.wasm"
+else
+  echo "build-wasm.sh: no wasm-opt (npm install in games/raffle/web adds it); the wasm is not optimised"
+fi
 ls -l "$out/zecraft_raffle_wasm_bg.wasm"

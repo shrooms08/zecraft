@@ -13,7 +13,8 @@ interface Props {
 }
 
 export function RaffleSection({ board, config, configJson, rounds, error }: Props) {
-  const spacing = config?.chain.target_spacing_secs ?? 25;
+  // Seconds per block: what the chain does now, else the target, else 25 s.
+  const spacing = board?.recent_spacing_secs || config?.chain.target_spacing_secs || 25;
   return (
     <Section id="live" title="Built with Zecraft: live on testnet">
       <article id="raffle" aria-labelledby="raffle-title" className="raffle">
