@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Pids alive, the engine's board, the vault ledger and the chain tip.
+# GAME's (default raffle) pids, the engine's board, the vault ledger and the tip.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+. scripts/local/env.sh
 shopt -s nullglob
 bad=0
-echo "== processes"
+echo "== processes ($GAME)"
 for name in kh1 kh2 kh3 engine relay; do
-  pidfile=.zecraft/run/$name.pid
+  pidfile=$RUN/$name.pid
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
     echo "  ok    $name (pid $(cat "$pidfile"))"
   else
@@ -23,7 +24,7 @@ echo "== engine"
 curl -fsS -m 5 http://127.0.0.1:7787/v1/board | python3 -I -c '
 import json,sys; b=json.load(sys.stdin); g=b["game"]
 print("  tip %d (chain %d), round %d %s, window %d..%d, %d blocks left" % (b["tip_height"], b["chain_tip"], b["round"], b["status"], b["window"]["start"], b["window"]["end"]-1, b["blocks_remaining"]))
-print("  raffle: %s tickets in %s entries, pot %s zat, carry %d zat" % (g["tickets_sold"], g["entries"], g["pot_zat"], b["carry"]))' || { echo "  engine board unavailable"; bad=1; }
+print("  %s: %s, carry %d zat" % (g.get("game", "game"), ", ".join("%s %s" % (k, v) for k, v in g.items() if k != "game"), b["carry"]))' || { echo "  engine board unavailable"; bad=1; }
 curl -fsS -m 10 http://127.0.0.1:7787/v1/vault/ledger | python3 -I -c '
 import json,sys; l=json.load(sys.stdin)
 print("  vault %d zat: carry %d, owed %d, reserved fees %d, operator float %d, shortfall %d (wallet tip %d)" % (l["vault_balance"], l["carry"], l["unpaid_obligations"], l["reserved_fees"], l["operator_float"], l["shortfall"], l["last_reconciliation_height"]))' || { echo "  vault ledger unavailable"; bad=1; }

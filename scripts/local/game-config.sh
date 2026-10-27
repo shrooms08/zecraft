@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Writes config/raffle.testnet.json for genesis height G from the vault's
-# public values (.zecraft/vault.env). Usage: scripts/local/game-config.sh G
+# Writes config/<GAME>.testnet.json (GAME defaults to raffle) for genesis
+# height G from the vault's public values and the game's default parameters
+# (games/<GAME>/game-params.json). Usage: GAME=<name> scripts/local/game-config.sh G
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-G=${1:?usage: game-config.sh GENESIS_HEIGHT}
-[ -f .zecraft/vault.env ] || { echo "run keys.sh first" >&2; exit 1; }
+G=${1:?usage: GAME=<name> game-config.sh GENESIS_HEIGHT}
+. scripts/local/env.sh
+[ -f "$VAULT_ENV" ] || { echo "run GAME=$GAME scripts/local/keys.sh first" >&2; exit 1; }
+[ -f "$GAME_PARAMS" ] || { echo "$GAME_PARAMS is missing" >&2; exit 1; }
 mkdir -p config
-python3 -I - "$G" <<'PY'
+python3 -I - "$G" "$VAULT_ENV" "$GAME_PARAMS" "$GAME_CONFIG" <<'PY'
 import json, sys
-env = dict(l.strip().split("=", 1) for l in open(".zecraft/vault.env") if "=" in l)
+env = dict(l.strip().split("=", 1) for l in open(sys.argv[2]) if "=" in l)
+game = json.load(open(sys.argv[3]))
+out_path = sys.argv[4]
 g = int(sys.argv[1])
 config = {
     # ChainParams::testnet(G): 24 blocks of 25 s, ZIP 317 fee, drand quicknet,
@@ -31,14 +36,14 @@ config = {
         "mtp_window": 11,
         "honest_clock_skew_secs": 300,
     },
-    "game": {"ticket_price_zat": 100000, "entry_fee_zat": 5000, "output_fee_zat": 5000},
+    "game": game,
     "vault_address": env["VAULT_UA"],
     "sealing_public_key": env["SEALING_PUBLIC_KEY"],
     "uivk": env["VAULT_UIVK"],
     "initial_carry_zat": 0,
 }
-with open("config/raffle.testnet.json", "w") as f:
+with open(out_path, "w") as f:
     json.dump(config, f, indent=2)
     f.write("\n")
-print(f"config/raffle.testnet.json: genesis {g}, vault {env['VAULT_UA'][:16]}...")
+print(f"{out_path}: genesis {g}, vault {env['VAULT_UA'][:16]}...")
 PY

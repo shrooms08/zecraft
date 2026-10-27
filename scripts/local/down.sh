@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Stops only the processes recorded in .zecraft/run/*.pid.
+# Stops only GAME's (default raffle) processes recorded in <run>/*.pid.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+. scripts/local/env.sh
 shopt -s nullglob
-for pidfile in .zecraft/run/*.pid; do
+for pidfile in "$RUN"/*.pid; do
   name=$(basename "$pidfile" .pid); pid=$(cat "$pidfile")
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" && echo "stopped $name ($pid)"

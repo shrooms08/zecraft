@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
-# Zecraft local testnet keys: identities for keyholders 1-3 and the
-# coordinator, config/keyholder-{1,2,3}.json, a FROST DKG on testnet, and the
-# sealing and vault files the engine needs. Refuses to run twice (it would
-# make a new vault). Secrets stay under .zecraft/secrets (gitignored).
+# Zecraft local testnet keys for GAME (default raffle): identities for
+# keyholders 1-3 and the coordinator, the keyholder configs, a FROST DKG on
+# testnet, and the sealing and vault files the engine needs. Refuses to run
+# twice (it would make a new vault). Secrets stay under .zecraft (gitignored).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-B=./target/release
-KH=$B/zecraft-raffle-keyholder
-S=.zecraft/secrets
-D=.zecraft/data
+. scripts/local/env.sh
+KH=$KH_BIN
 LWD_PRIMARY=${ZECRAFT_LWD_PRIMARY:-https://testnet.zec.rocks:443}
 LWD_SECOND=${ZECRAFT_LWD_SECOND:-https://zaino.testnet.unsafe.zec.rocks:443}
-GAME_CONFIG=config/raffle.testnet.json
 
 die() { echo "keys.sh: $*" >&2; exit 1; }
 
-[ -x "$KH" ] || die "build first: env -u RUSTFLAGS cargo build --release"
+[ -x "$KH" ] || die "build first: env -u RUSTFLAGS cargo build --release -p zecraft-$GAME-server"
 [ ! -e "$S/vault/vault.json" ] || die "$S/vault/vault.json exists: the vault was already created (delete .zecraft only if you mean to make a new vault)"
 for port in 7701 7702 7703; do
   if lsof -iTCP:$port -sTCP:LISTEN -P >/dev/null 2>&1; then die "port $port is in use"; fi
 done
 
 umask 077
-mkdir -p "$S" "$D" config .zecraft/logs
+mkdir -p "$S" "$D" "$KH_CONFIG_DIR" "$LOGS"
 
 echo "== identities"
 declare -a ID
@@ -34,7 +31,7 @@ done
 COORD=$("$KH" identity-keygen --secrets-dir "$S/coordinator" 2>/dev/null | tail -1)
 echo "coordinator: $COORD"
 
-echo "== config/keyholder-{1,2,3}.json"
+echo "== $KH_CONFIG_DIR/keyholder-{1,2,3}.json"
 for n in 1 2 3; do
   peers=""
   for m in 1 2 3; do
@@ -44,7 +41,7 @@ for n in 1 2 3; do
     { \"identifier\": $m, \"url\": \"http://127.0.0.1:770$m\", \"identity\": \"${ID[$m]}\" }"
   done
   # Keyholder n prefers server n-1 (mod 2), so they read from different upstreams.
-  cat > "config/keyholder-$n.json" <<JSON
+  cat > "$KH_CONFIG_DIR/keyholder-$n.json" <<JSON
 {
   "identifier": $n,
   "threshold": 2,
@@ -67,8 +64,8 @@ echo "== DKG (testnet)"
 SESSION=$(openssl rand -hex 32)
 pids=()
 for n in 1 2 3; do
-  "$KH" dkg --config "config/keyholder-$n.json" --session "$SESSION" --network test \
-    > ".zecraft/logs/dkg-$n.log" 2>&1 &
+  "$KH" dkg --config "$KH_CONFIG_DIR/keyholder-$n.json" --session "$SESSION" --network test \
+    > "$LOGS/dkg-$n.log" 2>&1 &
   pids+=($!)
 done
 ok=1
@@ -78,8 +75,8 @@ for i in 0 1 2; do
   wait "${pids[$i]}" || ok=0
   { kill "$watchdog"; wait "$watchdog"; } 2>/dev/null || true
 done
-[ "$ok" = 1 ] || { tail -20 .zecraft/logs/dkg-*.log >&2; die "DKG failed (logs above)"; }
-grep -h "DKG complete\|sealing public key" .zecraft/logs/dkg-*.log || true
+[ "$ok" = 1 ] || { tail -20 "$LOGS"/dkg-*.log >&2; die "DKG failed (logs above)"; }
+grep -h "DKG complete\|sealing public key" "$LOGS"/dkg-*.log || true
 
 echo "== sealing and vault files"
 [ -s "$S/keyholder-1/payout-sealing.json" ] || die "the lead keyholder wrote no payout-sealing.json"
@@ -94,7 +91,7 @@ done
 echo "== every keyholder derives the same vault"
 first=""
 for n in 1 2 3; do
-  out=$("$KH" address --config "config/keyholder-$n.json" 2>/dev/null)
+  out=$("$KH" address --config "$KH_CONFIG_DIR/keyholder-$n.json" 2>/dev/null)
   [ -n "$out" ] || die "keyholder $n prints no address"
   if [ -z "$first" ]; then first=$out
   elif [ "$out" != "$first" ]; then
@@ -105,7 +102,7 @@ done
 UA=$(echo "$first" | sed -n 1p)
 UIVK=$(echo "$first" | sed -n 2p)
 SEAL_PK=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["public_key"])' "$S/vault/payout-sealing.json")
-cat > .zecraft/vault.env <<ENV
+cat > "$VAULT_ENV" <<ENV
 VAULT_UA=$UA
 VAULT_UIVK=$UIVK
 SEALING_PUBLIC_KEY=$SEAL_PK
@@ -116,4 +113,4 @@ echo "all three keyholders agree"
 echo "vault UA:   $UA"
 echo "vault UIVK: $UIVK"
 echo "sealing public key: $SEAL_PK"
-echo "public values saved to .zecraft/vault.env"
+echo "public values saved to $VAULT_ENV"
