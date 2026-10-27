@@ -4585,6 +4585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zecraft-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "zecraft-core",
+]
+
+[[package]]
 name = "zecraft-coinflip"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,23 @@
+[package]
+name = "zecraft-cli"
+version = "0.1.0"
+description = "The `zecraft` command: scaffolds a new game (`zecraft new <name>`) from the coin flip"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "zecraft"
+path = "src/main.rs"
+
+[dependencies]
+zecraft-core = { path = "../zecraft-core" }
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }
