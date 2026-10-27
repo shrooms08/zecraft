@@ -1,0 +1,17 @@
+{
+  "identifier": 2,
+  "threshold": 2,
+  "signers": 3,
+  "bind": "127.0.0.1:7702",
+  "data_dir": ".zecraft/data/kh2",
+  "secrets_dir": ".zecraft/secrets/keyholder-2",
+  "game_config": "config/raffle.testnet.json",
+  "lightwalletd": ["https://testnet.zec.rocks:443", "https://zaino.testnet.unsafe.zec.rocks:443"],
+  "peers": [
+    { "identifier": 1, "url": "http://127.0.0.1:7701", "identity": "ee154a33fe9c2a4a2f971b5313d9a0f055ec794b4a102b23b88c59e4b5988dbc" },
+    { "identifier": 3, "url": "http://127.0.0.1:7703", "identity": "a15cb3ce7dfb7394685945375bf545816628c77066b05745849268b620b6dd6c" }
+  ],
+  "coordinator_identity": "75dca0cd708705f6941938e40d6d175ded7871bae433ff956b3d831863139169",
+  "poll_secs": 10,
+  "dkg": false
+}

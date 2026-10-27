@@ -51,6 +51,10 @@ pub struct Health {
     pub vault_address: Option<String>,
     pub tip_height: Option<u32>,
     pub settled_rounds: usize,
+    /// Highest round this node has settled itself (rounds settle in order),
+    /// so a coordinator can wait for it before asking for signatures.
+    #[serde(default)]
+    pub last_settled_round: Option<u32>,
     pub open_sessions: usize,
     pub lightwalletd: Vec<zecraft_vault::pool::ServerStatus>,
 }
@@ -281,11 +285,17 @@ async fn sign_round2<R: Rules>(
 
 async fn health<R: Rules>(State(state): State<Arc<AppState<R>>>) -> Response {
     let keys = state.keys.read().await.clone();
-    let (tip_height, settled_rounds) = state
+    let (tip_height, settled_rounds, last_settled_round) = state
         .chain
-        .read(|db| Ok::<_, zecraft_engine::EngineError>((db.tip()?, db.settled_rounds()?)))
-        .map_or((None, 0), |(tip, rounds)| {
-            (tip.map(|b| b.height), rounds.len())
+        .read(|db| {
+            Ok::<_, zecraft_engine::EngineError>((
+                db.tip()?,
+                db.settled_rounds()?,
+                db.last_settled_round()?,
+            ))
+        })
+        .map_or((None, 0, None), |(tip, rounds, last)| {
+            (tip.map(|b| b.height), rounds.len(), last)
         });
     let body = Health {
         identifier: state.config.identifier,
@@ -293,6 +303,7 @@ async fn health<R: Rules>(State(state): State<Arc<AppState<R>>>) -> Response {
         vault_address: keys.map(|k| k.vault.address.clone()),
         tip_height,
         settled_rounds,
+        last_settled_round,
         open_sessions: state.signer.open_sessions(),
         lightwalletd: state.chain_servers.status(),
     };

@@ -177,6 +177,45 @@ pub fn payable_receiver(
         .ok_or_else(|| "the opened receiver is not a valid Orchard address".to_owned())
 }
 
+/// How long a payout attempt waits for the keyholders to settle the round
+/// with their own followers before asking them to sign (they refuse a round
+/// they have not settled). After it, the round falls back to the retry backoff.
+pub const KEYHOLDER_SETTLE_WAIT: Duration = Duration::from_secs(90);
+/// How often the keyholders' health is polled during that wait.
+pub const KEYHOLDER_SETTLE_POLL: Duration = Duration::from_secs(3);
+
+/// Polls `fetch` (each keyholder's identifier and its last settled round)
+/// until at least `threshold` keyholders report `round` settled, or `wait`
+/// passes. Returns the ready keyholders, or the last count on timeout.
+pub async fn wait_for_settled<F, Fut>(
+    round: u32,
+    threshold: u16,
+    wait: Duration,
+    poll: Duration,
+    mut fetch: F,
+) -> Result<Vec<u16>, usize>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Vec<(u16, Option<u32>)>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let ready: Vec<u16> = fetch()
+            .await
+            .into_iter()
+            .filter(|(_, last)| last.is_some_and(|last| last >= round))
+            .map(|(id, _)| id)
+            .collect();
+        if ready.len() >= usize::from(threshold) {
+            return Ok(ready);
+        }
+        if tokio::time::Instant::now() + poll > deadline {
+            return Err(ready.len());
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// How long the API reuses a computed ledger (it opens the wallet database).
 const LEDGER_CACHE: Duration = Duration::from_secs(15);
 
@@ -402,6 +441,36 @@ impl Coordinator {
         })
     }
 
+    /// Each keyholder's last settled round, as its health endpoint reports
+    /// it (`None` when it does not answer).
+    async fn keyholder_settled_rounds(&self) -> Vec<(u16, Option<u32>)> {
+        #[derive(serde::Deserialize)]
+        struct Health {
+            #[serde(default)]
+            last_settled_round: Option<u32>,
+        }
+        let mut out = Vec::with_capacity(self.settings.keyholders.len());
+        for keyholder in &self.settings.keyholders {
+            let last = async {
+                self.http
+                    .get(format!("{}/v1/health", keyholder.url))
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await
+                    .ok()?
+                    .error_for_status()
+                    .ok()?
+                    .json::<Health>()
+                    .await
+                    .ok()?
+                    .last_settled_round
+            }
+            .await;
+            out.push((keyholder.identifier, last));
+        }
+        out
+    }
+
     /// Probes every keyholder's health endpoint, then records the results.
     pub async fn probe_keyholders(&self, store: &Store) -> Result<(), EngineError> {
         let now = std::time::SystemTime::now()
@@ -537,6 +606,27 @@ impl Coordinator {
         }
         if let Some(existing) = store.read(|db| db.payout(round))? {
             return Err(EngineError::AlreadyPaid(vec![existing.round]));
+        }
+        // Each keyholder settles the round with its own follower and refuses
+        // a round it has not settled: wait for enough of them first.
+        let threshold = self.settings.threshold;
+        match wait_for_settled(
+            round,
+            threshold,
+            KEYHOLDER_SETTLE_WAIT,
+            KEYHOLDER_SETTLE_POLL,
+            || self.keyholder_settled_rounds(),
+        )
+        .await
+        {
+            Ok(ready) => tracing::info!(round, ?ready, "keyholders have settled the round"),
+            Err(ready) => {
+                return Err(EngineError::KeyholdersBehind {
+                    round,
+                    ready,
+                    threshold,
+                })
+            }
         }
 
         // Outputs: one per payable payout, memo naming the round and reason.
@@ -1318,6 +1408,50 @@ impl RetryBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waits_until_enough_keyholders_have_settled_the_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        // Poll 1: nobody; poll 2: keyholder 1; poll 3: keyholders 1 and 3.
+        let fetch = || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 => vec![(1, None), (2, Some(3)), (3, None)],
+                    1 => vec![(1, Some(4)), (2, Some(3)), (3, Some(3))],
+                    _ => vec![(1, Some(4)), (2, None), (3, Some(5))],
+                }
+            }
+        };
+        let ready = wait_for_settled(
+            4,
+            2,
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            fetch,
+        )
+        .await
+        .expect("ready");
+        assert_eq!(ready, vec![1, 3]);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_the_bounded_wait() {
+        let fetch = || async { vec![(1, Some(7)), (2, Some(6)), (3, None)] };
+        let started = std::time::Instant::now();
+        let result = wait_for_settled(
+            7,
+            2,
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+            fetch,
+        )
+        .await;
+        assert_eq!(result, Err(1), "only keyholder 1 has settled round 7");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
     use proptest::collection::vec;
     use proptest::prelude::*;
 

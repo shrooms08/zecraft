@@ -67,6 +67,13 @@ pub enum EngineError {
     #[error("relay request failed: {0}")]
     Relay(String),
 
+    #[error("only {ready} of the {threshold} keyholders needed have settled round {round} themselves; not asking for signatures yet")]
+    KeyholdersBehind {
+        round: u32,
+        ready: usize,
+        threshold: u16,
+    },
+
     #[error("round {round} cannot be settled before round {missing} is settled")]
     SettlementOrder { round: u32, missing: u32 },
 

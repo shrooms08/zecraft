@@ -10,7 +10,9 @@ S=.zecraft/secrets
 D=.zecraft/data
 GAME_CONFIG=config/raffle.testnet.json
 ENGINE_LWD=${ZECRAFT_ENGINE_LWD:-https://testnet.zec.rocks:443}
-RELAY_LWD=${ZECRAFT_RELAY_LWD:-https://zaino.testnet.unsafe.zec.rocks:443}
+# zaino first (independent of the engine); testnet.zec.rocks keeps the relay up
+# while zaino is down (it was, HTTP 503, during Phase C).
+RELAY_LWD=${ZECRAFT_RELAY_LWD:-https://zaino.testnet.unsafe.zec.rocks:443,https://testnet.zec.rocks:443}
 
 die() { echo "up.sh: $*" >&2; exit 1; }
 [ -f .zecraft/vault.env ] || die "run scripts/local/keys.sh first"
