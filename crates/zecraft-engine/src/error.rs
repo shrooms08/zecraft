@@ -47,19 +47,19 @@ pub enum EngineError {
     ReorgTooDeep(u32),
 
     #[error("game rule error: {0}")]
-    Rounds(#[from] zecraft_core::rounds::RoundError),
+    Rounds(#[from] zecraft_core::draw::RoundError),
 
     #[error("settlement error: {0}")]
-    Settle(#[from] zecraft_core::settle::SettleError),
+    Settle(#[from] zecraft_core::rules::SettlementError),
 
     #[error("timing rule error: {0}")]
-    Timing(#[from] zecraft_core::timing::TimingError),
+    Timing(#[from] zecraft_core::draw::TimingError),
 
     #[error("beacon error: {0}")]
-    Beacon(#[from] zecraft_core::beacon::BeaconError),
+    Beacon(#[from] zecraft_core::draw::BeaconError),
 
     #[error("draw error: {0}")]
-    Random(#[from] zecraft_core::random::RandomError),
+    Random(#[from] zecraft_core::draw::RandomError),
 
     #[error("no relay returned a verifiable beacon for drand round {round}: {attempts}")]
     BeaconUnavailable { round: u64, attempts: String },

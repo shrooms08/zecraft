@@ -43,14 +43,14 @@ pub struct FullNote {
 }
 
 /// Trial-decrypts outputs with one prepared incoming viewing key.
-pub struct DigScanner {
+pub struct EntryScanner {
     ivk: PreparedIncomingViewingKey,
 }
 
-impl DigScanner {
+impl EntryScanner {
     /// Wraps the vault's external-scope IVK.
     pub fn new(ivk: PreparedIncomingViewingKey) -> Self {
-        DigScanner { ivk }
+        EntryScanner { ivk }
     }
 
     /// Finds the outputs of `tx` that pay the vault.
@@ -272,20 +272,26 @@ impl DigScanner {
 mod tests {
     use super::*;
     use crate::synthetic::{SyntheticChain, TestVault};
-    use zecraft_core::memo::DigMemo;
+    use zecraft_core::entry::EntryMemo;
+    use zecraft_raffle::{Tickets, FORMAT};
 
     #[test]
     fn external_ivk_sees_payments_but_not_change() {
         let vault = TestVault::new(3);
         let mut chain = SyntheticChain::new(&vault, 100, 1_700_000_000);
-        let memo = vault.dig_memo(0, 4, 2);
+        let memo = vault.entry_memo(&FORMAT, 0, Tickets(4), 2);
         chain.push_block(vec![
-            chain.payment(250_000, Pool::Ironwood, memo.encode()),
+            chain.payment(250_000, Pool::Ironwood, memo.encode(&FORMAT)),
             chain.change(50_000),
             chain.payment(70_000, Pool::Orchard, [0xF6; 512]),
         ]);
         let block = chain.block(100).expect("block");
-        let scanner = DigScanner::new(vault.config(100).incoming_viewing_key().expect("ivk"));
+        let scanner = EntryScanner::new(
+            vault
+                .config(100, zecraft_raffle::RaffleParams::default())
+                .incoming_viewing_key()
+                .expect("ivk"),
+        );
 
         let mut all = Vec::new();
         for (i, tx) in block.vtx.iter().enumerate() {
@@ -311,7 +317,10 @@ mod tests {
             <[u8; 32]>::try_from(block.vtx[0].ironwood_actions[0].cmx.as_slice()).expect("cmx"),
             "the recorded commitment is the compact block's"
         );
-        assert_eq!(DigMemo::decode(&ironwood[0].memo).expect("memo"), memo);
+        assert_eq!(
+            EntryMemo::<Tickets>::decode(&FORMAT, &ironwood[0].memo).expect("memo"),
+            memo
+        );
         let (_, orchard) = &all[1];
         assert_eq!(orchard[0].pool, Pool::Orchard);
         assert_eq!(orchard[0].value, 70_000);

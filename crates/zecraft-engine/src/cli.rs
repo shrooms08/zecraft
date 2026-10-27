@@ -1,43 +1,44 @@
-//! `zecraft-engine` binary: follows testnet, settles rounds, serves the API.
+//! The round server's process: follows the chain, settles rounds with a
+//! game's [`Rules`], coordinates payouts and serves the API. A game's engine
+//! binary is one call: `crate::cli::main(MyGame, "my-game-engine")`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::api::{router, AppState};
+use crate::beacon::RelayFetcher;
+use crate::chain::{self, PoolSource};
+use crate::config::{EngineSettings, GameConfig};
+use crate::coordinator::{Coordinator, CoordinatorSettings};
+use crate::decrypt::EntryScanner;
+use crate::edge;
+use crate::processor::{Event, Processor};
+use crate::relay::{LightwalletdBackend, RelayState};
+use crate::store::Store;
 use anyhow::Context;
-use clap::Parser;
+use clap::{FromArgMatches, Parser};
 use tokio::sync::broadcast;
-use zecraft_engine::api::{router, AppState};
-use zecraft_engine::beacon::RelayFetcher;
-use zecraft_engine::chain::{self, PoolSource};
-use zecraft_engine::config::{EngineSettings, GameConfig};
-use zecraft_engine::coordinator::{Coordinator, CoordinatorSettings};
-use zecraft_engine::decrypt::DigScanner;
-use zecraft_engine::edge;
-use zecraft_engine::processor::{Event, Processor};
-use zecraft_engine::relay::{LightwalletdBackend, RelayState};
-use zecraft_engine::store::Store;
+use zecraft_core::rules::Rules;
 
 #[derive(Parser)]
-#[command(
-    name = "zecraft-engine",
-    version,
-    about = "Zeek round engine (Zcash testnet)"
-)]
+#[command(version, about = "Zecraft round server (Zcash testnet)")]
 struct Cli {}
 
-
-fn main() -> anyhow::Result<()> {
+/// Runs the engine for `rules` until Ctrl-C. `name` is the binary's name,
+/// shown by `--help`.
+pub fn main<R: Rules + Clone>(rules: R, name: &'static str) -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    let Cli {} = Cli::parse();
-    let _log_guard = zecraft_engine::logging::init("engine")?;
+    use clap::CommandFactory;
+    let Cli {} = Cli::from_arg_matches_mut(&mut Cli::command().name(name).get_matches())?;
+    let _log_guard = crate::logging::init("engine")?;
     let settings = EngineSettings::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting async runtime")?;
-    let config = GameConfig::load(&settings.game_config_path)
+    let config = GameConfig::load(&settings.game_config_path, &rules)
         .with_context(|| format!("loading {}", settings.game_config_path.display()))?;
-    runtime.block_on(run(settings, config))
+    runtime.block_on(run(rules, settings, config))
 }
 
 /// Worker threads of the chain loop's own runtime.
@@ -47,42 +48,46 @@ const CHAIN_WORKERS: usize = 2;
 const PROBE_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the vault wallet is synced between payouts, so the public
-/// ledger's vault balance is never far behind the Cache.
+/// ledger's vault balance is never far behind the settlements.
 const VAULT_SYNC_EVERY: Duration = Duration::from_secs(300);
 
 /// Longest an engine pass may run (a payout proof takes about a minute).
 const PASS_TIMEOUT: Duration = Duration::from_secs(600);
 
-async fn run(settings: EngineSettings, config: GameConfig) -> anyhow::Result<()> {
-    let scanner = DigScanner::new(config.incoming_viewing_key()?);
+async fn run<R: Rules + Clone>(
+    rules: R,
+    settings: EngineSettings,
+    config: GameConfig<R::Params>,
+) -> anyhow::Result<()> {
+    let scanner = EntryScanner::new(config.incoming_viewing_key()?);
     let store = Arc::new(Store::open(&settings.db_path)?);
     // One pool for the chain loop, the relay and the coordinator: one health
     // view, one failover order.
-    let pool = Arc::new(settings.pool(config.params.network)?);
+    let pool = Arc::new(settings.pool(config.chain.network)?);
     pool.probe().await;
-    tracing::info!(servers = ?settings.servers(config.params.network), "lightwalletd pool");
+    tracing::info!(servers = ?settings.servers(config.chain.network), "lightwalletd pool");
     let source = PoolSource::new(pool.clone());
     let fetcher = RelayFetcher::new(settings.relays.clone())?;
     let (events, _) = broadcast::channel::<Event>(256);
     tracing::info!(
-        genesis = config.genesis_height,
-        blocks_per_round = config.params.blocks_per_round,
+        genesis = config.chain.genesis_height,
+        blocks_per_round = config.chain.blocks_per_round,
         db = %settings.db_path.display(),
         "engine starting"
     );
 
-    let digging = settings.digging(config.params.network);
-    if !digging {
-        tracing::warn!(network = ?config.params.network, "READINESS MODE: digging is off; the vault address is withheld and nothing is paid or served publicly");
+    let entries_open = settings.entries_open(config.chain.network);
+    if !entries_open {
+        tracing::warn!(network = ?config.chain.network, "READINESS MODE: entries are off; the vault address is withheld and nothing is paid or served publicly");
     }
     let coordinator_settings = CoordinatorSettings::from_env()?;
     anyhow::ensure!(
-        digging || coordinator_settings.is_none(),
-        "digging is off: the payout coordinator must not run (unset ZECRAFT_KEYHOLDERS)"
+        entries_open || coordinator_settings.is_none(),
+        "entries are off: the payout coordinator must not run (unset ZECRAFT_KEYHOLDERS)"
     );
     anyhow::ensure!(
-        digging || settings.public.is_none(),
-        "digging is off: the engine must not be exposed (unset ZECRAFT_PUBLIC_BIND)"
+        entries_open || settings.public.is_none(),
+        "entries are off: the engine must not be exposed (unset ZECRAFT_PUBLIC_BIND)"
     );
     let coordinator = match coordinator_settings {
         Some(settings) => {
@@ -102,22 +107,19 @@ async fn run(settings: EngineSettings, config: GameConfig) -> anyhow::Result<()>
     let state = Arc::new(AppState {
         keyholder_ids,
         threshold,
-        processor: Processor::new(config.clone()),
+        processor: Processor::new(rules.clone(), config.clone()),
         store: store.clone(),
         events: events.clone(),
         started: Instant::now(),
         ledger: coordinator.as_ref().map(Coordinator::ledger_view),
         chain_servers: Some(pool.clone()),
-        digging,
-        demo_digs: std::env::var("ZECRAFT_DEMO_DIGS").as_deref() == Ok("on"),
-        stream_slots: Arc::new(tokio::sync::Semaphore::new(zecraft_engine::api::MAX_STREAMS)),
+        entries_open,
+        stream_slots: Arc::new(tokio::sync::Semaphore::new(crate::api::MAX_STREAMS)),
         relay: Some(Arc::new(RelayState::new(
             Box::new(LightwalletdBackend::new(pool.clone())),
             RelayState::rate_from_env(),
         ))),
-        proof_limiter: zecraft_engine::relay::RateLimiter::new(
-            zecraft_engine::api::PROOF_SUBMISSIONS_PER_MIN,
-        ),
+        proof_limiter: crate::relay::RateLimiter::new(crate::api::PROOF_SUBMISSIONS_PER_MIN),
     });
 
     let listener = tokio::net::TcpListener::bind(&settings.bind)
@@ -199,6 +201,7 @@ async fn run(settings: EngineSettings, config: GameConfig) -> anyhow::Result<()>
                 .and_then(|rt| {
                     rt.block_on(async {
                         tokio::spawn(chain_loop(
+                            rules,
                             loop_state,
                             source,
                             fetcher,
@@ -233,17 +236,19 @@ async fn run(settings: EngineSettings, config: GameConfig) -> anyhow::Result<()>
 }
 
 /// Follows the chain, settles rounds and pays them, until Ctrl-C.
-async fn chain_loop(
-    state: Arc<AppState>,
+#[allow(clippy::too_many_arguments)]
+async fn chain_loop<R: Rules + Clone>(
+    rules: R,
+    state: Arc<AppState<R>>,
     mut source: PoolSource,
     mut fetcher: RelayFetcher,
     mut coordinator: Option<Coordinator>,
-    scanner: DigScanner,
-    config: GameConfig,
+    scanner: EntryScanner,
+    config: GameConfig<R::Params>,
     poll_secs: u64,
 ) {
     let store = state.store.clone();
-    let mut processor = Processor::new(config.clone());
+    let mut processor = Processor::new(rules, config.clone());
     let mut last_board = None;
     let mut last_probe = Instant::now();
     // The first pass syncs the vault wallet at once.
@@ -256,7 +261,7 @@ async fn chain_loop(
             last_probe = Instant::now();
         }
         let pass = async {
-            let report = chain::ingest(&mut source, &store, &scanner, &config).await?;
+            let report = chain::ingest(&mut source, &store, &scanner, &config.chain).await?;
             if report.new_blocks > 0 || report.new_notes > 0 || report.reorg_from.is_some() {
                 tracing::info!(
                     tip = ?report.stored_tip,
@@ -282,7 +287,7 @@ async fn chain_loop(
                 });
             }
             if let Some(coordinator) = coordinator.as_mut() {
-                match coordinator.pay_next(&store, &processor, &config).await {
+                match coordinator.pay_next(&store, &processor).await {
                     Ok(Some(report)) => events_out.push(Event::Paid {
                         round: report.round,
                         txid: report.txid,
@@ -306,7 +311,7 @@ async fn chain_loop(
                     }
                 }
                 if let Err(e) = coordinator
-                    .record_openings(&store, &mut source, &config)
+                    .record_openings(&store, &mut source, &processor)
                     .await
                 {
                     tracing::warn!(error = %e, "recording payout openings failed; retrying next pass");

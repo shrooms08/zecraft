@@ -1,7 +1,7 @@
 [package]
 name = "zecraft-engine"
 version = "0.1.0"
-description = "Zeek round engine: follows testnet, detects digs with the vault's incoming viewing key, settles rounds with zecraft-core, serves the board"
+description = "Zecraft round server: follows the chain, detects entries with the vault's incoming viewing key, settles rounds with a game's Rules, coordinates payouts, serves the board"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,10 +9,6 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
-
-[[bin]]
-name = "zecraft-engine"
-path = "src/bin/zecraft-engine.rs"
 
 [dependencies]
 zecraft-core = { path = "../zecraft-core" }
@@ -68,7 +64,9 @@ rogue-demo = []
 
 [dev-dependencies]
 zecraft-engine = { path = ".", features = ["testkit"] }
-proptest = "1.6"
+# The kit's example game: the engine's tests run real rounds of it.
+zecraft-raffle = { path = "../../games/raffle/rules" }
+proptest = ">=1.6, <1.7"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -1,21 +1,26 @@
-//! `zecraft-verify`: verify a Zeek round or a win proof against any lightwalletd.
+//! The verifier's command line, for any game: a game's verify binary is one
+//! call, `zecraft_verify::cli::main(MyGame, "my-game-verify")`.
 //!
 //! ```text
-//! zecraft-verify round 74 --engine http://127.0.0.1:7787 --lightwalletd https://testnet.zec.rocks:443
-//! zecraft-verify round 74 --bundle round-74.proof.json --config config/game.testnet.json --lightwalletd ...
-//! zecraft-verify win <proof id | file> --engine ... --lightwalletd ...
-//! zecraft-verify relay --lightwalletd https://zaino.testnet.unsafe.zec.rocks:443 --bind 127.0.0.1:7790
+//! <game>-verify round 74 --engine http://127.0.0.1:7787 --lightwalletd https://testnet.zec.rocks:443
+//! <game>-verify round 74 --bundle round-74.proof.json --config game.testnet.json --lightwalletd ...
+//! <game>-verify win <proof id | file> --engine ... --lightwalletd ...
+//! <game>-verify relay --lightwalletd https://zaino.testnet.unsafe.zec.rocks:443 --bind 127.0.0.1:7790
 //! ```
 //!
 //! Only the proof bundle and the game's public configuration (parameters,
-//! vault address, UIVK) come from Zeek; every block and transaction comes
-//! from the lightwalletd given, which can be anyone's.
+//! vault address, UIVK) come from the operator; every block and transaction
+//! comes from the lightwalletd given, which can be anyone's.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::chain::{txid_bytes, Blocks, MinedTx};
+use crate::checks::{self, PublicConfig, RoundInput};
+use crate::report::CheckStatus;
+use crate::win::{self, WinProof};
 use anyhow::{bail, Context};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -33,16 +38,10 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, ChainSpec, Empty, TxFilter};
 use zecraft_core::proof::ProofBundle;
-use zecraft_verify::chain::{txid_bytes, Blocks, MinedTx};
-use zecraft_verify::checks::{self, PublicConfig, RoundInput};
-use zecraft_verify::report::CheckStatus;
-use zecraft_verify::win::{self, WinProof};
+use zecraft_core::rules::Rules;
 
 #[derive(Parser)]
-#[command(
-    name = "zecraft-verify",
-    about = "Independently verify Zeek rounds and win proofs"
-)]
+#[command(about = "Independently verify Zecraft rounds and win proofs")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -53,14 +52,14 @@ struct Sources {
     /// Any lightwalletd (gRPC, http:// or https://).
     #[arg(long, env = "ZECRAFT_VERIFY_LIGHTWALLETD")]
     lightwalletd: String,
-    /// Zeek engine to fetch the proof bundle and public config from.
+    /// Game engine to fetch the proof bundle and public config from.
     #[arg(
         long,
         env = "ZECRAFT_VERIFY_ENGINE",
         default_value = "http://127.0.0.1:7787"
     )]
     engine: String,
-    /// Public game config (JSON with params, vault_address, uivk) instead of
+    /// Public game config (JSON with chain, game, vault_address, uivk) instead of
     /// the engine's /v1/config.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -203,27 +202,34 @@ async fn engine_json<T: serde::de::DeserializeOwned>(
     Ok(response.json().await?)
 }
 
-async fn public_config(sources: &Sources) -> anyhow::Result<PublicConfig> {
+async fn public_config<P: serde::de::DeserializeOwned>(
+    sources: &Sources,
+) -> anyhow::Result<PublicConfig<P>> {
     match &sources.config {
         Some(path) => Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?),
         None => engine_json(&sources.engine, "/v1/config").await,
     }
 }
 
-async fn round_bundle(
+async fn round_bundle<P: serde::de::DeserializeOwned>(
     sources: &Sources,
     round: u32,
     file: Option<&PathBuf>,
-) -> anyhow::Result<ProofBundle> {
+) -> anyhow::Result<ProofBundle<P>> {
     match file {
         Some(path) => Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?),
         None => engine_json(&sources.engine, &format!("/v1/rounds/{round}/proof")).await,
     }
 }
 
-async fn run_round(round: u32, file: Option<PathBuf>, sources: Sources) -> anyhow::Result<bool> {
-    let config = public_config(&sources).await?;
-    let bundle = round_bundle(&sources, round, file.as_ref()).await?;
+async fn run_round<R: Rules>(
+    rules: &R,
+    round: u32,
+    file: Option<PathBuf>,
+    sources: Sources,
+) -> anyhow::Result<bool> {
+    let config: PublicConfig<R::Params> = public_config(&sources).await?;
+    let bundle: ProofBundle<R::Params> = round_bundle(&sources, round, file.as_ref()).await?;
     if bundle.round != round {
         bail!("the bundle is for round {}, not {round}", bundle.round);
     }
@@ -244,6 +250,7 @@ async fn run_round(round: u32, file: Option<PathBuf>, sources: Sources) -> anyho
         txs.insert(txid.clone(), transaction(&mut client, &txid).await?);
     }
     let report = checks::verify_round(&RoundInput {
+        rules,
         config: &config,
         bundle: &bundle,
         blocks: &chain,
@@ -254,10 +261,8 @@ async fn run_round(round: u32, file: Option<PathBuf>, sources: Sources) -> anyho
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Round {} (bundle format {}, rules v{})",
-            report.round,
-            report.bundle_version,
-            report.rules_version.unwrap_or(0)
+            "Round {} (bundle format {})",
+            report.round, report.bundle_version
         );
         println!(
             "Chain source: {} (blocks {start}..={end}, {} transactions)",
@@ -307,7 +312,7 @@ async fn run_win(proof_ref: String, sources: Sources) -> anyhow::Result<bool> {
     };
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.trim())?;
     let proof = WinProof::decode(&bytes)?;
-    let bundle = round_bundle(&sources, proof.round, None).await?;
+    let bundle: ProofBundle<serde_json::Value> = round_bundle(&sources, proof.round, None).await?;
     let mut client = connect(&sources.lightwalletd).await?;
     let mined = transaction(&mut client, &proof.payout_txid).await?;
     let chain = Blocks::new(blocks(&mut client, mined.height, mined.height).await?);
@@ -724,8 +729,10 @@ async fn run_relay(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// Runs the verifier for `rules`; exits with status 1 when a check fails.
+pub fn main<R: Rules>(rules: R, name: &'static str) -> anyhow::Result<()> {
+    use clap::{CommandFactory, FromArgMatches};
+    let cli = Cli::from_arg_matches_mut(&mut Cli::command().name(name).get_matches())?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -735,7 +742,7 @@ fn main() -> anyhow::Result<()> {
                 round,
                 bundle,
                 sources,
-            } => run_round(round, bundle, sources).await,
+            } => run_round(&rules, round, bundle, sources).await,
             Command::Win { proof, sources } => run_win(proof, sources).await,
             Command::Relay {
                 lightwalletd,
@@ -791,14 +798,20 @@ mod tests {
             secret: Some(SECRET.into()),
             direct: None,
         };
-        let ok = headers(&[("x-zecraft-proxy", SECRET), ("x-zecraft-client", "203.0.113.7")]);
+        let ok = headers(&[
+            ("x-zecraft-proxy", SECRET),
+            ("x-zecraft-client", "203.0.113.7"),
+        ]);
         assert_eq!(client_of(&access, &ok, PEER), Ok(ip("203.0.113.7")));
         let none = headers(&[("x-forwarded-for", "203.0.113.7")]);
         assert_eq!(
             client_of(&access, &none, PEER).map_err(|e| e.0),
             Err(StatusCode::FORBIDDEN)
         );
-        let wrong = headers(&[("x-zecraft-proxy", "x"), ("x-zecraft-client", "203.0.113.7")]);
+        let wrong = headers(&[
+            ("x-zecraft-proxy", "x"),
+            ("x-zecraft-client", "203.0.113.7"),
+        ]);
         assert_eq!(
             client_of(&access, &wrong, PEER).map_err(|e| e.0),
             Err(StatusCode::FORBIDDEN)
@@ -823,7 +836,10 @@ mod tests {
             Err(StatusCode::BAD_REQUEST)
         );
         // A proxy header proves nothing to a relay without a secret: ignored.
-        let proxied = headers(&[("x-zecraft-proxy", SECRET), ("x-forwarded-for", "203.0.113.9")]);
+        let proxied = headers(&[
+            ("x-zecraft-proxy", SECRET),
+            ("x-forwarded-for", "203.0.113.9"),
+        ]);
         assert_eq!(client_of(&access, &proxied, PEER), Ok(ip("203.0.113.9")));
     }
 }

@@ -15,12 +15,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use zecraft_core::board::TileTotals;
-use zecraft_core::digs;
-use zecraft_core::params::GameParams;
-use zecraft_core::rounds::{RoundContext, RoundStatus, RoundWindow};
-use zecraft_core::seal::SealingPublicKey;
-use zecraft_core::settle::{Payout, RoundOutcome};
+use zecraft_core::draw::{RoundContext, RoundStatus, RoundWindow};
+use zecraft_core::entry::SealingPublicKey;
+use zecraft_core::params::ChainParams;
+use zecraft_core::rules::{Payout, PayoutKind, Rules};
 
 use crate::config::{GameConfig, SETTLE_CONFIRMATIONS};
 use crate::coordinator::LedgerView;
@@ -32,8 +30,8 @@ use crate::proof::ProofBundle;
 use crate::store::{Reader, Store};
 
 /// Shared state of the HTTP handlers.
-pub struct AppState {
-    pub processor: Processor,
+pub struct AppState<R: Rules> {
+    pub processor: Processor<R>,
     /// Shared with the engine loop; handlers read through its read pool.
     pub store: Arc<Store>,
     pub events: broadcast::Sender<Event>,
@@ -43,10 +41,8 @@ pub struct AppState {
     pub ledger: Option<LedgerView>,
     /// The engine's `lightwalletd` servers (for the status page).
     pub chain_servers: Option<Arc<zecraft_vault::pool::Pool>>,
-    /// Whether digs are open (false: mainnet readiness, vault withheld).
-    pub digging: bool,
-    /// Whether the demo digger runs (`ZECRAFT_DEMO_DIGS=on`).
-    pub demo_digs: bool,
+    /// Whether entries are open (false: the vault is withheld).
+    pub entries_open: bool,
     /// Open `/v1/stream` connections allowed at once.
     pub stream_slots: Arc<tokio::sync::Semaphore>,
     /// Present when this engine relays chain data to browser wallets.
@@ -61,7 +57,7 @@ pub struct AppState {
 }
 
 /// `GET /v1/board`: the board.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoardResponse {
     #[serde(flatten)]
     pub board: BoardState,
@@ -91,29 +87,35 @@ pub struct StoredProof {
     pub verdict: zecraft_verify::win::WinVerdict,
 }
 
-/// `GET /v1/config`.
+/// The game's memo format, so clients can build entries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigResponse {
-    pub params: GameParams,
-    /// Whether this engine accepts digs. When false (mainnet readiness) the
-    /// vault's address, sealing key and viewing key are withheld, so nobody
-    /// can send funds to a vault that is not open.
-    pub digging_enabled: bool,
-    /// Whether Zeek's own test wallets dig on this network (scripts/
-    /// demo-digger.sh), so the app can say so.
-    #[serde(default)]
-    pub demo_digs: bool,
+pub struct MemoInfo {
+    /// The four magic bytes, as ASCII.
+    pub magic: String,
+    pub version: u8,
+    pub text_prefix: String,
+}
+
+/// `GET /v1/config`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConfigResponse<P> {
+    pub chain: ChainParams,
+    pub game: P,
+    pub memo: MemoInfo,
+    /// Whether this engine accepts entries. When false the vault's address,
+    /// sealing key and viewing key are withheld, so nobody can send funds to
+    /// a vault that is not open.
+    pub entries_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealing_public_key: Option<SealingPublicKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uivk: Option<String>,
-    pub genesis_height: u32,
     /// Confirmations the engine waits for after the timing-rule blocks.
     pub settle_confirmations: u32,
-    /// Deep Cache balance carried into round 0 from a previous vault.
-    pub initial_cache_zat: u64,
+    /// Value carried into round 0 from a previous vault.
+    pub initial_carry_zat: u64,
 }
 
 /// `GET /v1/rounds/pending`.
@@ -123,68 +125,40 @@ pub struct PendingResponse {
 }
 
 /// Post-settlement details of a round.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SettledRound {
-    pub outcome: RoundOutcome,
-    pub treasure_tile: Option<u8>,
-    pub cache_triggered: bool,
-    /// Exact value dug per tile.
-    pub tile_totals: [u64; 25],
+    pub voided: bool,
+    /// The game's outcome.
+    pub outcome: serde_json::Value,
     pub drand_round: u64,
     pub beacon_time: u64,
-    pub pot: u64,
-    pub rake: u64,
-    pub distributable: u64,
-    pub winners: usize,
+    /// Everything the round received.
+    pub received: u64,
+    pub carry_in: u64,
+    pub carry_out: u64,
     /// Outputs the keyholders must sign (sealed receivers only).
     pub payouts: Vec<Payout>,
-    pub previous_cache: u64,
-    pub new_cache: u64,
-    pub cache_in: u64,
-    pub cache_paid: u64,
-    /// Dig fees plus output fees.
-    pub total_fees: u64,
-    /// Dig fees charged to the notes the payout transaction spends (rules v2;
-    /// absent in views saved under rules v1).
-    #[serde(default)]
-    pub dig_fees: u64,
-    pub total_paid: u64,
-    pub forfeited: u64,
-    /// Shouts (rules v4): their value minus `shout_fees` went to the Cache.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub shouts: u64,
-    /// Dig fees reserved for spending the shout notes later.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub shout_fees: u64,
-    /// Rules the round was settled under (1 or 2; views saved before the
-    /// field existed are rules v1).
-    #[serde(default = "rules_v1")]
-    pub rules_version: u32,
+    pub paid: u64,
+    pub fees: u64,
     pub plan_status: PlanStatus,
     pub settled_at_height: u32,
     /// Payout transaction, once broadcast.
     pub payout: Option<PayoutRecord>,
 }
 
-fn rules_v1() -> u32 {
-    1
-}
-
-fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
 /// `GET /v1/rounds/{n}`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoundResponse {
     pub round: u32,
     pub status: RoundStatus,
     pub window: RoundWindow,
     pub context: RoundContext,
-    /// Valid digs counted so far (or at settlement).
-    pub digs: usize,
-    /// Relative depths while the round is not settled.
-    pub depths: [u8; 25],
+    /// Valid entries counted so far (or at settlement).
+    pub entries: usize,
+    /// Refunded entries.
+    pub refunds: usize,
+    /// The game's board of the round (`Rules::board`), as-is.
+    pub game: serde_json::Value,
     pub settled: Option<SettledRound>,
 }
 
@@ -238,27 +212,27 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
 /// A read-only connection: never waits for the engine loop's writes.
-fn reader(state: &AppState) -> Result<Reader<'_>, ApiError> {
+fn reader<R: Rules>(state: &AppState<R>) -> Result<Reader<'_>, ApiError> {
     Ok(state.store.reader()?)
 }
 
 /// Builds the router.
-pub fn router(state: Arc<AppState>, cors_origins: &[String]) -> Router {
+pub fn router<R: Rules>(state: Arc<AppState<R>>, cors_origins: &[String]) -> Router {
     let mut router = Router::new()
-        .route("/v1/config", get(config))
-        .route("/v1/board", get(board))
-        .route("/v1/rounds/pending", get(pending))
-        .route("/v1/rounds/{round}", get(round))
-        .route("/v1/rounds/{round}/proof", get(proof))
-        .route("/v1/health", get(health))
-        .route("/v1/status", get(status))
-        .route("/v1/vault/ledger", get(vault_ledger))
-        .route("/v1/stream", get(stream))
-        .route("/v1/rounds", get(rounds_list))
-        .route("/v1/rounds/{round}/digests", get(round_digests))
-        .route("/v1/keyholders/status", get(keyholders_status))
-        .route("/v1/proofs", axum::routing::post(submit_proof))
-        .route("/v1/proofs/{id}", get(get_proof))
+        .route("/v1/config", get(config::<R>))
+        .route("/v1/board", get(board::<R>))
+        .route("/v1/rounds/pending", get(pending::<R>))
+        .route("/v1/rounds/{round}", get(round::<R>))
+        .route("/v1/rounds/{round}/proof", get(proof::<R>))
+        .route("/v1/health", get(health::<R>))
+        .route("/v1/status", get(status::<R>))
+        .route("/v1/vault/ledger", get(vault_ledger::<R>))
+        .route("/v1/stream", get(stream::<R>))
+        .route("/v1/rounds", get(rounds_list::<R>))
+        .route("/v1/rounds/{round}/digests", get(round_digests::<R>))
+        .route("/v1/keyholders/status", get(keyholders_status::<R>))
+        .route("/v1/proofs", axum::routing::post(submit_proof::<R>))
+        .route("/v1/proofs/{id}", get(get_proof::<R>))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_PROOF_BODY))
         .with_state(state.clone());
     if let Some(relay) = &state.relay {
@@ -279,38 +253,45 @@ pub fn router(state: Arc<AppState>, cors_origins: &[String]) -> Router {
     router
 }
 
-/// The public config response (`digging`: whether digs are open;
-/// `demo_digs`: whether Zeek's own test wallets dig).
-pub fn config_response(config: &GameConfig, digging: bool, demo_digs: bool) -> ConfigResponse {
-    let open = |v| if digging { Some(v) } else { None };
+/// The public config response (`entries_open`: whether entries are open).
+pub fn config_response<R: Rules>(
+    config: &GameConfig<R::Params>,
+    entries_open: bool,
+) -> ConfigResponse<R::Params> {
+    let open = |v| if entries_open { Some(v) } else { None };
     ConfigResponse {
-        params: config.params.clone(),
-        digging_enabled: digging,
-        demo_digs,
+        chain: config.chain.clone(),
+        game: config.game.clone(),
+        memo: MemoInfo {
+            magic: String::from_utf8_lossy(&R::FORMAT.magic).into_owned(),
+            version: R::FORMAT.version,
+            text_prefix: R::FORMAT.text_prefix.to_owned(),
+        },
+        entries_open,
         vault_address: open(config.vault_address.clone()),
-        sealing_public_key: digging.then(|| config.sealing_public_key.clone()),
+        sealing_public_key: entries_open.then(|| config.sealing_public_key.clone()),
         uivk: open(config.uivk.clone()),
-        genesis_height: config.genesis_height,
         settle_confirmations: SETTLE_CONFIRMATIONS,
-        initial_cache_zat: config.initial_cache_zat,
+        initial_carry_zat: config.initial_carry_zat,
     }
 }
 
-async fn config(State(state): State<Arc<AppState>>) -> ApiResult<ConfigResponse> {
-    Ok(Json(config_response(
+async fn config<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
+) -> ApiResult<ConfigResponse<R::Params>> {
+    Ok(Json(config_response::<R>(
         state.processor.config(),
-        state.digging,
-        state.demo_digs,
+        state.entries_open,
     )))
 }
 
-async fn board(State(state): State<Arc<AppState>>) -> ApiResult<BoardResponse> {
+async fn board<R: Rules>(State(state): State<Arc<AppState<R>>>) -> ApiResult<BoardResponse> {
     let db = reader(&state)?;
     let board = state.processor.board(&db)?;
     Ok(Json(BoardResponse { board }))
 }
 
-async fn pending(State(state): State<Arc<AppState>>) -> ApiResult<PendingResponse> {
+async fn pending<R: Rules>(State(state): State<Arc<AppState<R>>>) -> ApiResult<PendingResponse> {
     let db = reader(&state)?;
     Ok(Json(PendingResponse {
         rounds: state.processor.pending_rounds(&db)?,
@@ -318,56 +299,28 @@ async fn pending(State(state): State<Arc<AppState>>) -> ApiResult<PendingRespons
 }
 
 /// Builds the round response (shared with tests).
-pub fn round_response(
-    processor: &Processor,
+pub fn round_response<R: Rules>(
+    processor: &Processor<R>,
     db: &Db,
     round: u32,
 ) -> Result<RoundResponse, EngineError> {
-    let params = &processor.config().params;
     let (window, status, context) = processor.status(db, round)?;
     let settlement = db.settlement(round)?;
     let payout = db.payout(round)?;
-    let voided = status == RoundStatus::Voided;
-    let notes = db
-        .notes_in_range(window.start, window.end)?
-        .iter()
-        .map(|n| n.to_received_note())
-        .collect::<Vec<_>>();
-    let classified = digs::classify_round(params, round, voided, notes)?;
-    let totals =
-        TileTotals::from_digs(&classified).map_err(|e| EngineError::Corrupt(e.to_string()))?;
+    let classified = processor.classified(db, round, status == RoundStatus::Voided)?;
     let settled = settlement.map(|row| {
-        let (treasure_tile, cache_triggered) = match row.outcome {
-            RoundOutcome::Voided => (None, false),
-            RoundOutcome::Drawn {
-                treasure_tile,
-                cache_triggered,
-            } => (Some(treasure_tile), cache_triggered),
-        };
         let s = row.settlement;
         SettledRound {
-            outcome: row.outcome,
-            treasure_tile,
-            cache_triggered,
-            tile_totals: totals.0,
+            voided: row.voided,
+            outcome: s.outcome,
             drand_round: row.drand_round,
             beacon_time: row.beacon_time,
-            pot: s.pot,
-            rake: s.rake,
-            distributable: s.distributable,
-            winners: s.winners,
+            received: s.received,
+            carry_in: s.carry_in,
+            carry_out: s.carry_out,
             payouts: s.payouts,
-            previous_cache: s.previous_cache,
-            new_cache: s.new_cache,
-            cache_in: s.cache_in,
-            cache_paid: s.cache_paid,
-            total_fees: s.total_fees,
-            dig_fees: s.dig_fees,
-            total_paid: s.total_paid,
-            forfeited: s.forfeited,
-            shouts: s.shouts,
-            shout_fees: s.shout_fees,
-            rules_version: row.rules_version,
+            paid: s.paid,
+            fees: s.fees,
             plan_status: row.status,
             settled_at_height: row.settled_at_height,
             payout: payout.clone(),
@@ -378,14 +331,17 @@ pub fn round_response(
         status,
         window,
         context,
-        digs: classified.valid.len(),
-        depths: totals.relative_depths(),
+        entries: classified.valid.len(),
+        refunds: classified.refunds.len(),
+        game: processor
+            .rules()
+            .board(&processor.config().game, &classified),
         settled,
     })
 }
 
-async fn round(
-    State(state): State<Arc<AppState>>,
+async fn round<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     Path(round): Path<u32>,
 ) -> ApiResult<RoundResponse> {
     let db = reader(&state)?;
@@ -393,11 +349,11 @@ async fn round(
 }
 
 /// Builds the proof bundle of a settled round (shared with tests).
-pub fn proof_response(
-    processor: &Processor,
+pub fn proof_response<R: Rules>(
+    processor: &Processor<R>,
     db: &Db,
     round: u32,
-) -> Result<Option<ProofBundle>, EngineError> {
+) -> Result<Option<ProofBundle<R::Params>>, EngineError> {
     match db.settlement(round)? {
         Some(row) => Ok(Some(processor.proof_bundle(db, &row)?)),
         None => Ok(None),
@@ -409,12 +365,12 @@ pub const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 /// A proof bundle is final once its payout is mined (its openings are in)
 /// or when it pays nothing; until then it may still gain the openings.
-pub fn bundle_is_final(bundle: &ProofBundle) -> bool {
+pub fn bundle_is_final<P>(bundle: &ProofBundle<P>) -> bool {
     bundle.payout_openings.is_some() || bundle.settlement.payouts.is_empty()
 }
 
-async fn proof(
-    State(state): State<Arc<AppState>>,
+async fn proof<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     Path(round): Path<u32>,
 ) -> Result<Response, ApiError> {
     let db = reader(&state)?;
@@ -434,7 +390,7 @@ async fn proof(
     }
 }
 
-async fn vault_ledger(State(state): State<Arc<AppState>>) -> ApiResult<Ledger> {
+async fn vault_ledger<R: Rules>(State(state): State<Arc<AppState<R>>>) -> ApiResult<Ledger> {
     let Some(view) = &state.ledger else {
         return Err(ApiError(
             StatusCode::NOT_FOUND,
@@ -444,7 +400,7 @@ async fn vault_ledger(State(state): State<Arc<AppState>>) -> ApiResult<Ledger> {
     Ok(Json(view.ledger(&state.store, &state.processor)?))
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> ApiResult<HealthResponse> {
+async fn health<R: Rules>(State(state): State<Arc<AppState<R>>>) -> ApiResult<HealthResponse> {
     let db = reader(&state)?;
     Ok(Json(HealthResponse {
         ok: true,
@@ -474,14 +430,14 @@ pub struct StatusResponse {
     /// Unix seconds when this was produced.
     pub now: u64,
     pub network: zecraft_core::params::Network,
-    pub digging_enabled: bool,
+    pub entries_open: bool,
     pub engine: EngineStatus,
     pub threshold: u16,
     pub keyholders: Vec<KeyholderStatus>,
     pub chain_servers: Vec<zecraft_vault::pool::ServerStatus>,
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> ApiResult<StatusResponse> {
+async fn status<R: Rules>(State(state): State<Arc<AppState<R>>>) -> ApiResult<StatusResponse> {
     let db = reader(&state)?;
     let tip = db.tip()?;
     Ok(Json(StatusResponse {
@@ -489,8 +445,8 @@ async fn status(State(state): State<Arc<AppState>>) -> ApiResult<StatusResponse>
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        network: state.processor.config().params.network,
-        digging_enabled: state.digging,
+        network: state.processor.config().chain.network,
+        entries_open: state.entries_open,
         engine: EngineStatus {
             uptime_secs: state.started.elapsed().as_secs(),
             stored_tip: tip.as_ref().map(|b| b.height),
@@ -514,91 +470,80 @@ pub struct RoundsQuery {
     /// Only rounds below this one (pagination).
     pub before: Option<u32>,
     pub limit: Option<u32>,
-    /// `1` to include rounds nobody dug in.
+    /// `1` to include rounds nobody entered.
     pub include_empty: Option<u8>,
 }
 
 /// One past round, amounts only.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoundSummary {
     pub round: u32,
-    /// `paid` (winners paid), `paying` (payout being signed or not yet
-    /// broadcast), `no_winner` (nobody dug the treasure tile: the prize went
-    /// to the Deep Cache), `voided` (closed too late to be safe: refunded).
+    /// `paid` (payouts broadcast), `paying` (payout being signed or not yet
+    /// broadcast), `no_win` (no winning output: the value carried over),
+    /// `voided` (closed too late to be safe: refunded).
     pub status: String,
-    pub treasure_tile: Option<u8>,
-    pub cache_triggered: bool,
-    /// Sum of the valid digs after dig fees.
-    pub pot: u64,
-    /// What the winners split (after the rake).
-    pub prize: u64,
-    pub total_paid: u64,
-    pub winners: usize,
+    /// The game's outcome.
+    pub outcome: serde_json::Value,
+    pub received: u64,
+    pub paid: u64,
+    pub carry_out: u64,
+    pub wins: usize,
     pub refunds: usize,
     /// Unix time of the window's last block, if stored.
     pub closed_time: Option<u64>,
     /// Unix time the beacon was published.
     pub revealed_time: u64,
     pub payout_txid: Option<String>,
-    pub rules_version: u32,
 }
 
 /// `GET /v1/rounds`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoundsResponse {
     pub rounds: Vec<RoundSummary>,
     pub next_before: Option<u32>,
 }
 
 /// Summarises a settled round.
-pub fn round_summary(
+pub fn round_summary<R: Rules>(
     db: &Db,
-    processor: &Processor,
+    processor: &Processor<R>,
     row: &crate::db::SettlementRow,
 ) -> Result<RoundSummary, EngineError> {
     let s = &row.settlement;
-    let (treasure_tile, cache_triggered) = match row.outcome {
-        RoundOutcome::Voided => (None, false),
-        RoundOutcome::Drawn {
-            treasure_tile,
-            cache_triggered,
-        } => (Some(treasure_tile), cache_triggered),
-    };
     let payout = db.payout(row.round)?;
-    let refunds = s
+    let wins = s
         .payouts
         .iter()
-        .filter(|p| matches!(p.reason, zecraft_core::settle::PayoutReason::Refund(_)))
+        .filter(|p| p.kind == PayoutKind::Win)
         .count();
-    let status = match row.outcome {
-        RoundOutcome::Voided => "voided",
-        RoundOutcome::Drawn { .. } if s.payouts.is_empty() => "no_winner",
-        RoundOutcome::Drawn { .. } if s.winners == 0 => "no_winner",
-        RoundOutcome::Drawn { .. } => match &payout {
-            Some(p) if p.state == crate::db::PayoutState::Broadcast => "paid",
-            _ => "paying",
-        },
+    let paid_out = matches!(&payout, Some(p) if p.state == crate::db::PayoutState::Broadcast);
+    let status = if row.voided {
+        "voided"
+    } else if wins == 0 {
+        "no_win"
+    } else if paid_out {
+        "paid"
+    } else {
+        "paying"
     };
-    let window = zecraft_core::rounds::round_window(&processor.config().params, row.round)?;
+    let window = zecraft_core::draw::round_window(&processor.config().chain, row.round)?;
     Ok(RoundSummary {
         round: row.round,
         status: status.to_owned(),
-        treasure_tile,
-        cache_triggered,
-        pot: s.pot,
-        prize: s.distributable,
-        total_paid: s.total_paid,
-        winners: s.winners,
-        refunds,
+        outcome: s.outcome.clone(),
+        received: s.received,
+        paid: s.paid,
+        carry_out: s.carry_out,
+        wins,
+        refunds: s.payouts.len() - wins,
         closed_time: db.block(window.last())?.map(|b| b.time),
         revealed_time: row.beacon_time,
         payout_txid: payout.and_then(|p| p.txid),
-        rules_version: row.rules_version,
     })
 }
 
-async fn rounds_list(
-    State(state): State<Arc<AppState>>,
+async fn rounds_list<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     axum::extract::Query(q): axum::extract::Query<RoundsQuery>,
 ) -> ApiResult<RoundsResponse> {
     let limit = q.limit.unwrap_or(20).clamp(1, 100) as usize;
@@ -620,7 +565,7 @@ async fn rounds_list(
         }
         if let Some(row) = db.settlement(r)? {
             let s = &row.settlement;
-            let empty = s.pot == 0 && s.forfeited == 0 && s.shouts == 0 && s.payouts.is_empty();
+            let empty = s.received == 0 && s.payouts.is_empty();
             if include_empty || !empty {
                 rounds.push(round_summary(&db, &state.processor, &row)?);
             }
@@ -657,12 +602,12 @@ pub struct DigestsResponse {
     pub notes: Vec<NoteDigest>,
 }
 
-async fn round_digests(
-    State(state): State<Arc<AppState>>,
+async fn round_digests<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     Path(round): Path<u32>,
 ) -> ApiResult<DigestsResponse> {
     use sha2::{Digest, Sha256};
-    let window = zecraft_core::rounds::round_window(&state.processor.config().params, round)
+    let window = zecraft_core::draw::round_window(&state.processor.config().chain, round)
         .map_err(|e| bad(StatusCode::BAD_REQUEST, e.to_string()))?;
     let db = reader(&state)?;
     // Late payments land after the window; include the next round's window
@@ -719,7 +664,10 @@ pub struct KeyholdersResponse {
 }
 
 /// Every configured keyholder's public status.
-fn keyholder_statuses(state: &AppState, db: &Db) -> Result<Vec<KeyholderStatus>, EngineError> {
+fn keyholder_statuses<R: Rules>(
+    state: &AppState<R>,
+    db: &Db,
+) -> Result<Vec<KeyholderStatus>, EngineError> {
     let health = db.keyholder_health()?;
     let counts = db.keyholder_counts()?;
     Ok(state
@@ -736,7 +684,7 @@ fn keyholder_statuses(state: &AppState, db: &Db) -> Result<Vec<KeyholderStatus>,
             KeyholderStatus {
                 identifier: *id,
                 label: format!("Keyholder {letter}"),
-                operator: "Zeek team".to_owned(),
+                operator: "game operator".to_owned(),
                 reachable: h.map(|h| h.reachable),
                 last_seen: h.and_then(|h| h.last_seen),
                 last_check: h.map(|h| h.last_check),
@@ -747,7 +695,9 @@ fn keyholder_statuses(state: &AppState, db: &Db) -> Result<Vec<KeyholderStatus>,
         .collect())
 }
 
-async fn keyholders_status(State(state): State<Arc<AppState>>) -> ApiResult<KeyholdersResponse> {
+async fn keyholders_status<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
+) -> ApiResult<KeyholdersResponse> {
     let db = reader(&state)?;
     let keyholders = keyholder_statuses(&state, &db)?;
     let mut refused_attempts: Vec<RefusedAttempt> = Vec::new();
@@ -784,8 +734,8 @@ fn bad(status: StatusCode, message: impl Into<String>) -> ApiError {
 /// Validates a win proof completely (against this engine's bundle of the
 /// round and the payout transaction fetched from its chain source) before
 /// storing it; proofs are public data.
-async fn submit_proof(
-    State(state): State<Arc<AppState>>,
+async fn submit_proof<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     client: Option<axum::Extension<crate::edge::ClientIp>>,
     Json(body): Json<SubmitProof>,
 ) -> Result<(StatusCode, Json<StoredProof>), ApiError> {
@@ -844,7 +794,8 @@ async fn submit_proof(
         .blocks(height, height)
         .await
         .map_err(|e| bad(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let included = height > 0 && zecraft_verify::chain::Blocks::new(blocks).contains_tx(height, &txid);
+    let included =
+        height > 0 && zecraft_verify::chain::Blocks::new(blocks).contains_tx(height, &txid);
     let mined = zecraft_verify::chain::MinedTx {
         raw: raw.data,
         height,
@@ -883,7 +834,7 @@ fn verdict_round(bytes: &[u8]) -> u32 {
 }
 
 /// A stored (verified) win proof, restated.
-fn stored_proof(state: &AppState, id: &str) -> Result<Option<StoredProof>, ApiError> {
+fn stored_proof<R: Rules>(state: &AppState<R>, id: &str) -> Result<Option<StoredProof>, ApiError> {
     use base64::Engine;
     let Some((round, created_at, bytes)) = state.store.read(|db| db.win_proof(id))? else {
         return Ok(None);
@@ -902,7 +853,7 @@ fn stored_proof(state: &AppState, id: &str) -> Result<Option<StoredProof>, ApiEr
         verdict: zecraft_verify::win::WinVerdict {
             valid: true,
             claim: format!(
-                "Verified on submission: the holder controls the address that received round {}'s treasure payout {} (transaction {}).",
+                "Verified on submission: the holder controls the address that received round {}'s winning payout {} (transaction {}).",
                 proof.round, proof.payout_index, proof.payout_txid
             ),
             reason: None,
@@ -911,8 +862,8 @@ fn stored_proof(state: &AppState, id: &str) -> Result<Option<StoredProof>, ApiEr
     }))
 }
 
-async fn get_proof(
-    State(state): State<Arc<AppState>>,
+async fn get_proof<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     if id.len() != 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -974,9 +925,9 @@ impl Drop for StreamSlot {
 /// Largest client message accepted on `/v1/stream` (clients only listen).
 const MAX_CLIENT_MESSAGE: usize = 1_024;
 
-async fn stream(
+async fn stream<R: Rules>(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState<R>>>,
     client: Option<axum::Extension<crate::edge::ClientIp>>,
 ) -> Response {
     let address = client.map_or(std::net::IpAddr::from([0, 0, 0, 0]), |c| c.0 .0);
@@ -1007,7 +958,7 @@ async fn stream(
         })
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket<R: Rules>(mut socket: WebSocket, state: Arc<AppState<R>>) {
     let initial = state
         .store
         .read(|db| state.processor.board(db))

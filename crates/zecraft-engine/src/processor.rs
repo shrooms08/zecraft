@@ -1,32 +1,32 @@
 //! Round processing: status, timing rule, beacon, classification and
-//! settlement, every step delegated to `zecraft-core`.
+//! settlement. The chain side is the kit's (`zecraft-core::draw`); the game
+//! side is the game's [`Rules`], always through
+//! [`settle_checked`](zecraft_core::rules::settle_checked), so every
+//! settlement the engine stores passed the kit's invariants.
 //!
-//! Rounds settle strictly in order so that the Deep Cache balance carries
-//! from each settlement to the next. A round is settled only once the
-//! `mtp_window` blocks after its window are stored and the last of them has
+//! Rounds settle strictly in order so that the carry passes from each
+//! settlement to the next. A round is settled only once the `mtp_window`
+//! blocks after its window are stored and the last of them has
 //! [`SETTLE_CONFIRMATIONS`] confirmations, so a reorg can no longer change
 //! the inputs the settlement was computed from.
 
 use serde::{Deserialize, Serialize};
-use zecraft_core::beacon;
-use zecraft_core::board::BoardView;
-use zecraft_core::digs::{self, ClassifiedDigs};
-use zecraft_core::rounds::{self, RoundContext, RoundStatus, RoundWindow};
-use zecraft_core::settle::{self, RoundOutcome};
-use zecraft_core::timing::TimingVerdict;
+use zecraft_core::draw::{self, RoundContext, RoundStatus, RoundWindow, TimingVerdict};
+use zecraft_core::entry::Payload;
+use zecraft_core::rules::{settle_checked, Classified, InputRef, RoundInfo, Rules};
 
 use crate::beacon::{Backoff, BeaconFetcher};
 use crate::config::{GameConfig, SETTLE_CONFIRMATIONS};
-use crate::db::{BeaconRow, Db, PlanStatus, SettlementRow};
+use crate::db::{BeaconRow, Db, EntryKind, EntryRow, PlanStatus, SettlementRow};
 use crate::error::EngineError;
 use crate::proof::{ProofBundle, PROOF_VERSION};
 use crate::store::Store;
 
 /// Something that happened, pushed to WebSocket clients.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    /// The board changed (new block or new dig).
+    /// The board changed (new block or new entry).
     Board(BoardState),
     /// A round's window closed.
     RoundClosed {
@@ -35,18 +35,20 @@ pub enum Event {
         drand_round: u64,
         beacon_time: u64,
     },
-    /// A beacon was verified and the treasure drawn.
+    /// A beacon was verified for a round.
     Reveal {
         round: u32,
         drand_round: u64,
-        treasure_tile: u8,
-        cache_triggered: bool,
+        /// The beacon's randomness, hex.
+        randomness: String,
     },
     /// A settlement plan was stored.
     Settled {
         round: u32,
-        outcome: RoundOutcome,
-        new_cache: u64,
+        voided: bool,
+        /// The game's outcome.
+        outcome: serde_json::Value,
+        carry_out: u64,
     },
     /// A payout transaction was broadcast.
     Paid {
@@ -56,8 +58,9 @@ pub enum Event {
     },
 }
 
-/// The public board.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The public board: the round clock (the kit's) and the game's own view of
+/// the round, served as the game returns it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoardState {
     /// Chain tip the engine has scanned (0 before the game's genesis block).
     pub tip_height: u32,
@@ -77,26 +80,16 @@ pub struct BoardState {
     /// Before genesis: `chain_tip_time + (genesis − chain_tip) · target_spacing`;
     /// `None` once the game has started.
     pub estimated_start_time: Option<u64>,
-    /// What winners would split right now: valid digs minus dig fees, minus
-    /// the rake.
-    pub prize_pool_zat: u64,
-    /// Gross total dug so far (plain sum of the valid digs, before dig fees
-    /// and rake). Not what is paid out.
-    pub gross_dug_zat: u64,
-    /// Rules version of this round (3 once text memos are active).
-    pub rules_version: u32,
-    /// Deep Cache balance carried into this round.
-    pub cache: u64,
-    /// Relative tile depths, `0..=100`.
-    pub depths: [u8; 25],
-    /// Depth stage 0 to 5 per tile (share of the round's total, bucketed).
-    pub stages: [u8; 25],
-    /// Number of valid digs so far.
-    pub digs: usize,
+    /// Value carried into this round.
+    pub carry: u64,
+    /// Valid entries so far.
+    pub entries: usize,
     /// Mean spacing of the last [`SPACING_SAMPLE_BLOCKS`] stored blocks, in
     /// seconds (how fast the chain runs now; wallets turn confirmations
     /// into minutes with it). None until enough blocks are stored.
     pub recent_spacing_secs: Option<u64>,
+    /// The game's board (`Rules::board`), as-is.
+    pub game: serde_json::Value,
 }
 
 /// Blocks the recent spacing is measured over.
@@ -124,36 +117,43 @@ pub struct PendingRound {
     pub beacon_time: u64,
 }
 
-/// Drives rounds forward.
-pub struct Processor {
-    config: GameConfig,
+/// Drives rounds forward for the game `R`.
+pub struct Processor<R: Rules> {
+    rules: R,
+    config: GameConfig<R::Params>,
     backoff: Backoff,
 }
 
-impl Processor {
+impl<R: Rules> Processor<R> {
     /// A processor for `config`.
-    pub fn new(config: GameConfig) -> Self {
+    pub fn new(rules: R, config: GameConfig<R::Params>) -> Self {
         Processor {
+            rules,
             config,
             backoff: Backoff::default(),
         }
     }
 
+    /// The game's rules.
+    pub fn rules(&self) -> &R {
+        &self.rules
+    }
+
     /// The game config.
-    pub fn config(&self) -> &GameConfig {
+    pub fn config(&self) -> &GameConfig<R::Params> {
         &self.config
     }
 
-    /// Cache balance after the last settled round.
-    pub fn cache_balance(&self, db: &Db) -> Result<u64, EngineError> {
+    /// Carry after the last settled round.
+    pub fn carry(&self, db: &Db) -> Result<u64, EngineError> {
         Ok(match db.last_settled_round()? {
             Some(round) => {
                 db.settlement(round)?
                     .ok_or_else(|| EngineError::Corrupt(format!("settlement {round} vanished")))?
                     .settlement
-                    .new_cache
+                    .carry_out
             }
-            None => self.config.initial_cache_zat,
+            None => self.config.initial_carry_zat,
         })
     }
 
@@ -163,8 +163,8 @@ impl Processor {
         db: &Db,
         round: u32,
     ) -> Result<(RoundWindow, RoundContext), EngineError> {
-        let params = &self.config.params;
-        let window = rounds::round_window(params, round)?;
+        let params = &self.config.chain;
+        let window = draw::round_window(params, round)?;
         let tip_height = db.tip()?.map(|b| b.height).unwrap_or(0);
         let start_block_time = db.block(window.start)?.map(|b| b.time);
         let post_close_block_times = db.block_times(
@@ -192,14 +192,14 @@ impl Processor {
         round: u32,
     ) -> Result<(RoundWindow, RoundStatus, RoundContext), EngineError> {
         let (window, ctx) = self.round_context(db, round)?;
-        let status = rounds::round_status(&self.config.params, round, &ctx)?;
+        let status = draw::round_status(&self.config.chain, round, &ctx)?;
         Ok((window, status, ctx))
     }
 
     /// The round the scanned tip belongs to (round 0 before the game starts).
     pub fn current_round(&self, db: &Db) -> Result<u32, EngineError> {
         let tip = db.tip()?.map(|b| b.height).unwrap_or(0);
-        Ok(rounds::round_for_height(&self.config.params, tip).unwrap_or(0))
+        Ok(draw::round_for_height(&self.config.chain, tip).unwrap_or(0))
     }
 
     /// Every note of `round` classified under the game rules.
@@ -208,40 +208,33 @@ impl Processor {
         db: &Db,
         round: u32,
         voided: bool,
-    ) -> Result<ClassifiedDigs, EngineError> {
-        let window = rounds::round_window(&self.config.params, round)?;
+    ) -> Result<Classified<R::Entry>, EngineError> {
+        let window = draw::round_window(&self.config.chain, round)?;
         let notes = db
             .notes_in_range(window.start, window.end)?
             .iter()
             .map(|n| n.to_received_note())
             .collect::<Vec<_>>();
-        Ok(digs::classify_round(
-            &self.config.params,
-            round,
-            voided,
-            notes,
-        )?)
+        Ok(self.rules.classify(
+            &self.config.game,
+            &RoundInfo {
+                round,
+                window,
+                voided,
+            },
+            &notes,
+        ))
     }
 
-    /// The notes the payout transaction of a settled round must spend, in the
-    /// deterministic order of [`settle::payout_inputs`].
-    pub fn payout_inputs(
-        &self,
-        db: &Db,
-        row: &SettlementRow,
-    ) -> Result<Vec<zecraft_core::digs::ReceivedNote>, EngineError> {
-        let voided = matches!(row.outcome, RoundOutcome::Voided);
-        let classified = self.classified(db, row.round, voided)?;
-        Ok(settle::payout_inputs(
-            &self.config.params,
-            &classified,
-            row.outcome,
-        )?)
+    /// The notes the payout transaction of a settled round must spend, in
+    /// canonical order, as its settlement states them.
+    pub fn payout_inputs(&self, row: &SettlementRow) -> Vec<InputRef> {
+        row.settlement.payout_inputs.clone()
     }
 
     /// The public board for the current round.
     pub fn board(&self, db: &Db) -> Result<BoardState, EngineError> {
-        let params = &self.config.params;
+        let params = &self.config.chain;
         let tip = db.tip()?;
         let (tip_height, tip_time) = tip.map(|b| (b.height, b.time)).unwrap_or((0, 0));
         // Before genesis nothing is stored; the chain tip lightwalletd reported
@@ -250,15 +243,7 @@ impl Processor {
         let round = self.current_round(db)?;
         let (window, status, _) = self.status(db, round)?;
         let classified = self.classified(db, round, status == RoundStatus::Voided)?;
-        let view = BoardView::new(
-            params,
-            round,
-            status,
-            chain_tip,
-            &classified,
-            self.cache_balance(db)?,
-        )
-        .map_err(|e| EngineError::Corrupt(e.to_string()))?;
+        let blocks_remaining = window.end.saturating_sub(chain_tip.saturating_add(1));
         let estimated_start_time = match (tip_time, db.chain_tip_time()?) {
             (0, Some(chain_tip_time)) if chain_tip < params.genesis_height => Some(
                 chain_tip_time
@@ -275,9 +260,7 @@ impl Processor {
             0
         } else {
             tip_time
-                .checked_add(
-                    u64::from(view.blocks_remaining).saturating_mul(params.target_spacing_secs),
-                )
+                .checked_add(u64::from(blocks_remaining).saturating_mul(params.target_spacing_secs))
                 .ok_or(EngineError::Overflow("estimated close time"))?
         };
         Ok(BoardState {
@@ -287,26 +270,22 @@ impl Processor {
             round,
             status,
             window,
-            blocks_remaining: view.blocks_remaining,
+            blocks_remaining,
             estimated_close_time,
             estimated_start_time,
-            prize_pool_zat: view.prize_pool_zat,
-            gross_dug_zat: view.gross_dug_zat,
-            rules_version: rounds::rules_version(params, round)?,
-            cache: view.cache,
-            depths: view.depths,
-            stages: view.stages,
-            digs: classified.valid.len(),
+            carry: self.carry(db)?,
+            entries: classified.valid.len(),
             recent_spacing_secs: mean_spacing(&db.block_times(
                 tip_height.saturating_sub(SPACING_SAMPLE_BLOCKS),
                 tip_height.saturating_add(1),
             )?),
+            game: self.rules.board(&self.config.game, &classified),
         })
     }
 
     /// Closed, unsettled rounds in order.
     pub fn pending_rounds(&self, db: &Db) -> Result<Vec<PendingRound>, EngineError> {
-        let params = &self.config.params;
+        let params = &self.config.chain;
         let tip = db.tip()?.map(|b| b.height).unwrap_or(0);
         let first = db.last_settled_round()?.map(|r| r + 1).unwrap_or(0);
         let current = self.current_round(db)?;
@@ -319,58 +298,45 @@ impl Processor {
             let Some(start_time) = ctx.start_block_time else {
                 continue;
             };
-            let drand_round = beacon::beacon_round_for(params, start_time)?;
+            let drand_round = draw::beacon_round_for(params, start_time)?;
             pending.push(PendingRound {
                 round,
                 window,
                 status,
                 drand_round,
-                beacon_time: beacon::beacon_time(params, drand_round)?,
+                beacon_time: draw::beacon_time(params, drand_round)?,
             });
         }
         Ok(pending)
     }
 
     /// The proof bundle of a settled round.
-    pub fn proof_bundle(&self, db: &Db, row: &SettlementRow) -> Result<ProofBundle, EngineError> {
-        let window = rounds::round_window(&self.config.params, row.round)?;
+    pub fn proof_bundle(
+        &self,
+        db: &Db,
+        row: &SettlementRow,
+    ) -> Result<ProofBundle<R::Params>, EngineError> {
+        let window = draw::round_window(&self.config.chain, row.round)?;
         let notes = db
             .notes_in_range(window.start, window.end)?
             .iter()
             .map(|n| n.to_received_note())
             .collect();
-        let beacon_row = db.beacon(row.drand_round)?;
-        let (beacon, randomness) = match row.outcome {
-            RoundOutcome::Voided => (None, None),
-            RoundOutcome::Drawn { .. } => {
-                let b = beacon_row.ok_or_else(|| {
-                    EngineError::Corrupt(format!(
-                        "beacon {} missing for drawn round {}",
-                        row.drand_round, row.round
-                    ))
-                })?;
-                (Some(b.beacon), Some(b.randomness))
-            }
+        let (beacon, randomness) = if row.voided {
+            (None, None)
+        } else {
+            let b = db.beacon(row.drand_round)?.ok_or_else(|| {
+                EngineError::Corrupt(format!(
+                    "beacon {} missing for drawn round {}",
+                    row.drand_round, row.round
+                ))
+            })?;
+            (Some(b.beacon), Some(b.randomness))
         };
-        // The bundle states the parameters the round was settled under: rounds
-        // of earlier rules versions predate the dig fee (v1) or the text-memo
-        // activation (v1, v2), whatever the current config says.
-        let mut params = self.config.params.clone();
-        if row.rules_version < 2 {
-            params.dig_fee_zat = 0;
-        }
-        if row.rules_version < 3 {
-            params.text_memo_activation_height = None;
-        }
-        if row.rules_version < 4 {
-            params.campfire = None;
-        }
         Ok(ProofBundle {
             version: PROOF_VERSION,
-            rules_version: Some(row.rules_version),
-            payout_openings: db.payout_openings(row.round)?,
-            unclaimable_payouts: db.unclaimable(row.round)?,
-            params,
+            chain: self.config.chain.clone(),
+            game: self.config.game.clone(),
             round: row.round,
             window,
             notes,
@@ -381,10 +347,11 @@ impl Processor {
             beacon,
             randomness,
             timing: row.timing,
-            outcome: row.outcome,
-            previous_cache: row.settlement.previous_cache,
+            carry_in: row.settlement.carry_in,
             settlement: row.settlement.clone(),
             payout: db.payout(row.round)?,
+            payout_openings: db.payout_openings(row.round)?,
+            unclaimable_payouts: db.unclaimable(row.round)?,
         })
     }
 
@@ -399,7 +366,7 @@ impl Processor {
         fetcher: &mut dyn BeaconFetcher,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let params = self.config.params.clone();
+        let params = self.config.chain.clone();
         let mut events = Vec::new();
         let Some(tip) = store.read(|db| db.tip())? else {
             return Ok(events);
@@ -423,19 +390,14 @@ impl Processor {
             let start_time = ctx.start_block_time.ok_or_else(|| {
                 EngineError::Corrupt(format!("start block of round {round} missing"))
             })?;
-            let drand_round = beacon::beacon_round_for(&params, start_time)?;
-            let beacon_time = beacon::beacon_time(&params, drand_round)?;
-            let timing = zecraft_core::timing::check_window_close(
-                &params,
-                beacon_time,
-                &ctx.post_close_block_times,
-            )?;
+            let drand_round = draw::beacon_round_for(&params, start_time)?;
+            let beacon_time = draw::beacon_time(&params, drand_round)?;
+            let timing =
+                draw::check_window_close(&params, beacon_time, &ctx.post_close_block_times)?;
 
             let mut new_beacon = None;
-            let outcome = match (status, timing) {
-                (RoundStatus::Voided, _) | (_, TimingVerdict::Unsafe { .. }) => {
-                    RoundOutcome::Voided
-                }
+            let randomness = match (status, timing) {
+                (RoundStatus::Voided, _) | (_, TimingVerdict::Unsafe { .. }) => None,
                 (RoundStatus::Revealable, TimingVerdict::Safe { .. }) => {
                     let fetched = match store.read(|db| db.beacon(drand_round))? {
                         Some(row) => row,
@@ -462,20 +424,12 @@ impl Processor {
                             }
                         }
                     };
-                    let treasure_tile =
-                        zecraft_core::random::treasure_tile(round, &fetched.randomness)?;
-                    let cache_triggered =
-                        zecraft_core::random::cache_triggers(&params, round, &fetched.randomness)?;
                     events.push(Event::Reveal {
                         round,
                         drand_round,
-                        treasure_tile,
-                        cache_triggered,
+                        randomness: hex::encode(fetched.randomness.0),
                     });
-                    RoundOutcome::Drawn {
-                        treasure_tile,
-                        cache_triggered,
-                    }
+                    Some(fetched.randomness)
                 }
                 (other, _) => {
                     return Err(EngineError::Corrupt(format!(
@@ -484,11 +438,19 @@ impl Processor {
                 }
             };
 
-            let voided = matches!(outcome, RoundOutcome::Voided);
-            let (classified, previous_cache) = store.read(|db| {
-                Ok::<_, EngineError>((self.classified(db, round, voided)?, self.cache_balance(db)?))
+            let voided = randomness.is_none();
+            let (classified, carry_in) = store.read(|db| {
+                Ok::<_, EngineError>((self.classified(db, round, voided)?, self.carry(db)?))
             })?;
-            let settlement = settle::settle(&params, round, &classified, previous_cache, outcome)?;
+            let settlement = settle_checked(
+                &self.rules,
+                &self.config.game,
+                &classified,
+                carry_in,
+                randomness.as_ref(),
+            )?
+            .erase()?;
+            let entries = entry_rows(&classified);
             let row = SettlementRow {
                 round,
                 settled_at_height: tip.height,
@@ -498,36 +460,76 @@ impl Processor {
                 drand_round,
                 beacon_time,
                 timing,
-                outcome,
+                voided,
                 settlement: settlement.clone(),
                 status: PlanStatus::AwaitingSignatures,
-                rules_version: rounds::rules_version(&params, round)?,
             };
             store.write(|db| {
                 db.transaction(|tx| {
                     if let Some(beacon) = &new_beacon {
                         tx.insert_beacon(beacon)?;
                     }
-                    tx.insert_settlement(&row)
+                    tx.insert_settlement(&row)?;
+                    tx.insert_entries(&entries)
                 })
             })?;
             tracing::info!(
                 round,
-                ?outcome,
-                pot = settlement.pot,
+                voided,
+                outcome = %settlement.outcome,
+                received = settlement.received,
                 payouts = settlement.payouts.len(),
-                new_cache = settlement.new_cache,
+                carry_out = settlement.carry_out,
                 "settlement plan stored (awaiting signatures)"
             );
             events.push(Event::Settled {
                 round,
-                outcome,
-                new_cache: settlement.new_cache,
+                voided,
+                outcome: settlement.outcome.clone(),
+                carry_out: settlement.carry_out,
             });
             round += 1;
         }
         Ok(events)
     }
+}
+
+/// The entries of a classified round, as the database stores them.
+pub fn entry_rows<E: Payload>(classified: &Classified<E>) -> Vec<EntryRow> {
+    let row = |note: &zecraft_core::rules::ReceivedNote, payload: Vec<u8>, sealed: &[u8], kind| {
+        EntryRow {
+            round: classified.round,
+            height: note.height,
+            txid: note.txid.clone(),
+            action_index: note.output_index,
+            value: note.value,
+            payload,
+            sealed_receiver: sealed.to_vec(),
+            kind,
+        }
+    };
+    let mut out: Vec<EntryRow> = classified
+        .valid
+        .iter()
+        .map(|v| {
+            row(
+                &v.note,
+                v.entry.to_bytes(),
+                v.sealed.as_bytes(),
+                EntryKind::Valid,
+            )
+        })
+        .collect();
+    // The refund's payload is the memo's, after the header's 4 + 1 + 4 bytes.
+    out.extend(classified.refunds.iter().map(|r| {
+        row(
+            &r.note,
+            r.aad.get(9..).unwrap_or_default().to_vec(),
+            r.sealed.as_bytes(),
+            EntryKind::Refund,
+        )
+    }));
+    out
 }
 
 #[cfg(test)]

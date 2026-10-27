@@ -80,9 +80,10 @@ impl MemoFormat {
         HEADER_PREFIX_LEN + payload_len + SEALED_RECEIVER_LEN
     }
 
-    /// Length of the text encoding of such a memo.
+    /// Length of the text encoding of such a memo: the prefix plus the
+    /// unpadded base64url of everything after the lead byte.
     pub const fn text_len(&self, payload_len: usize) -> usize {
-        self.text_prefix.len() + (self.memo_len(payload_len) - 1).div_ceil(3) * 4
+        self.text_prefix.len() + ((self.memo_len(payload_len) - 1) * 4).div_ceil(3)
     }
 
     /// The AAD (header without the lead byte) binding a sealed receiver:
@@ -564,6 +565,42 @@ pub(crate) mod tests {
         let mut other = field;
         other[0] = b'x';
         assert!(EntryMemo::<Digit>::decode_any(&FORMAT, &other).is_err());
+    }
+
+    /// Payloads of every length modulo 3, so the unpadded base64 length
+    /// formula is exercised for all three remainders.
+    #[test]
+    fn text_encoding_works_for_every_payload_length() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Bytes<const N: usize>([u8; N]);
+        impl<const N: usize> Payload for Bytes<N> {
+            const LEN: usize = N;
+            fn to_bytes(&self) -> Vec<u8> {
+                self.0.to_vec()
+            }
+            fn from_bytes(bytes: &[u8]) -> Result<Self, PayloadError> {
+                <[u8; N]>::try_from(bytes)
+                    .map(Bytes)
+                    .map_err(|_| PayloadError("length".into()))
+            }
+        }
+        fn check<const N: usize>() {
+            let mut rng = StdRng::seed_from_u64(N as u64);
+            let (_, pk) = generate_sealing_keypair(&mut rng);
+            let memo =
+                EntryMemo::seal(&FORMAT, 9, Bytes([N as u8; N]), &receiver(2), &pk, &mut rng)
+                    .expect("seal");
+            let text = memo.encode_text(&FORMAT);
+            assert_eq!(text.len(), FORMAT.text_len(N), "payload of {N} bytes");
+            assert_eq!(
+                EntryMemo::<Bytes<N>>::decode_any(&FORMAT, text.as_bytes()).expect("decode"),
+                memo
+            );
+        }
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<4>();
     }
 
     #[test]

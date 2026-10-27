@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use zecraft_core::beacon::{self, Beacon, Randomness};
+use zecraft_core::draw::beacon::{self, Beacon, Randomness};
 use zecraft_core::params::DrandChain;
 
 use crate::error::EngineError;

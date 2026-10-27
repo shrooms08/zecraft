@@ -2,8 +2,9 @@
 //! an honest payout for a settlement this node computed is approved and
 //! signable; every tampering (redirected output, changed amount, extra or
 //! missing output, missing or foreign input, needless float note, fee above
-//! the collected fees, foreign vault, unknown or v1 round, already-signed
-//! round) is refused with a reason naming the exact check and item.
+//! the collected fees, foreign vault, unknown round, already-signed round,
+//! spending a kept note) is refused with a reason naming the exact check and
+//! item. The game is the raffle.
 
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -28,18 +29,18 @@ use zcash_primitives::transaction::fees::zip317;
 use zcash_protocol::consensus::TEST_NETWORK;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
-use zecraft_core::digs;
-use zecraft_core::memo::{DigMemo, PayoutReceiver};
-use zecraft_core::params::{GameParams, Network};
-use zecraft_core::seal::generate_sealing_keypair;
-use zecraft_core::settle::{self, RoundOutcome, Settlement};
-use zecraft_core::timing::TimingVerdict;
+use zecraft_core::draw::{Randomness, TimingVerdict};
+use zecraft_core::entry::seal::generate_sealing_keypair;
+use zecraft_core::entry::{EntryMemo, PayoutReceiver, SealedReceiver};
+use zecraft_core::params::{ChainParams, Network};
+use zecraft_core::rules::{settle_checked, PayoutKind, Settlement};
 use zecraft_engine::config::GameConfig;
 use zecraft_engine::db::{BlockRow, Db, NoteRow, PlanStatus, Pool, SettlementRow};
 use zecraft_engine::processor::Processor;
 use zecraft_keyholder::db::NodeDb;
-use zecraft_keyholder::verify::{verify_payout, VerifyContext};
+use zecraft_keyholder::verify::{verify_payout, zat, VerifyContext};
 use zecraft_keyholder::KeyholderError;
+use zecraft_raffle::{Raffle, RaffleParams, Tickets, FORMAT};
 use zecraft_vault::frost;
 use zecraft_vault::keys;
 
@@ -57,8 +58,8 @@ const GENESIS: u32 = 4_499_000;
 /// A vault: FROST group key, viewing key, sealing key.
 struct Vault {
     fvk: FullViewingKey,
-    sealing: zecraft_core::seal::SealingPrivateKey,
-    sealing_pk: zecraft_core::seal::SealingPublicKey,
+    sealing: zecraft_core::entry::seal::SealingPrivateKey,
+    sealing_pk: zecraft_core::entry::seal::SealingPublicKey,
 }
 
 fn vault(seed: u64) -> Vault {
@@ -172,7 +173,7 @@ fn payout_pczt(
                 Some(v.fvk.to_ovk(Scope::External)),
                 *address,
                 Zatoshis::const_from_u64(*value),
-                MemoBytes::from_bytes(b"Zeek round 0: treasure").expect("memo"),
+                MemoBytes::from_bytes(b"Zecraft round 0: win").expect("memo"),
             )
             .expect("output");
         paid += value;
@@ -248,8 +249,8 @@ fn spend_index_of(pczt: &Pczt, cmx: &[u8; 32]) -> usize {
     found.expect("spend present")
 }
 
-/// A player: an address and a sealed dig memo for `round`/`tile`.
-fn player(v: &Vault, seed: u8, round: u32, tile: u8) -> (orchard::Address, DigMemo) {
+/// A player: an address and a sealed raffle memo for `round`/`tickets`.
+fn player(v: &Vault, seed: u8, round: u32, tickets: u16) -> (orchard::Address, EntryMemo<Tickets>) {
     let sk = loop {
         let mut bytes = [seed; 32];
         bytes[0] = bytes[0].wrapping_add(1);
@@ -264,9 +265,10 @@ fn player(v: &Vault, seed: u8, round: u32, tile: u8) -> (orchard::Address, DigMe
         network: Network::Test,
         orchard: address.to_raw_address_bytes(),
     };
-    let memo = DigMemo::seal(
+    let memo = EntryMemo::seal(
+        &FORMAT,
         round,
-        tile,
+        Tickets(tickets),
         &receiver,
         &v.sealing_pk,
         &mut StdRng::seed_from_u64(u64::from(seed)),
@@ -275,24 +277,25 @@ fn player(v: &Vault, seed: u8, round: u32, tile: u8) -> (orchard::Address, DigMe
     (address, memo)
 }
 
-/// A dig to store: value, memo, the vault note that carries it.
-struct Dig<'a> {
+/// A note to store: value, memo, the vault note that carries it.
+struct Entry<'a> {
     value: u64,
     memo: [u8; 512],
     note: &'a VaultNote,
     height: u32,
 }
 
-/// Stores `digs` as the node's notes and settles round 0 from them.
+/// The randomness every test round is drawn with.
+const DRAW: Randomness = Randomness([7; 32]);
+
+/// Stores `entries` as the node's notes and settles round 0 from them, as
+/// the node's own processor would.
 fn settle_round(
     db: &Db,
-    processor: &Processor,
-    digs: &[Dig<'_>],
-    outcome: RoundOutcome,
-    previous_cache: u64,
-    rules_version: u32,
+    processor: &Processor<Raffle>,
+    entries: &[Entry<'_>],
+    carry_in: u64,
 ) -> Settlement {
-    let params = &processor.config().params;
     db.insert_block(&BlockRow {
         height: GENESIS,
         hash: vec![1; 32],
@@ -300,27 +303,30 @@ fn settle_round(
         time: 1,
     })
     .expect("block");
-    let mut received = Vec::new();
-    for (i, dig) in digs.iter().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
         let row = NoteRow {
             txid: [0xaa; 32],
             action_index: i as u16,
             pool: Pool::Ironwood,
-            height: dig.height,
+            height: entry.height,
             block_time: 1,
-            value: dig.value,
-            memo: dig.memo.to_vec(),
-            cmx: Some(dig.note.cmx),
+            value: entry.value,
+            memo: entry.memo.to_vec(),
+            cmx: Some(entry.note.cmx),
         };
         assert!(db.insert_note(&row).expect("note"));
-        if dig.height < GENESIS + params.blocks_per_round {
-            received.push(row.to_received_note());
-        }
     }
-    let voided = matches!(outcome, RoundOutcome::Voided);
-    let classified = digs::classify_round(params, 0, voided, received).expect("classify");
-    let settlement =
-        settle::settle(params, 0, &classified, previous_cache, outcome).expect("settle");
+    let classified = processor.classified(db, 0, false).expect("classify");
+    let settlement = settle_checked(
+        processor.rules(),
+        &processor.config().game,
+        &classified,
+        carry_in,
+        Some(&DRAW),
+    )
+    .expect("settle")
+    .erase()
+    .expect("erase");
     db.insert_settlement(&SettlementRow {
         round: 0,
         settled_at_height: GENESIS,
@@ -333,16 +339,15 @@ fn settle_round(
             beacon_time: 3,
             margin_secs: 1,
         },
-        outcome,
+        voided: false,
         settlement: settlement.clone(),
         status: PlanStatus::AwaitingSignatures,
-        rules_version,
     })
     .expect("settlement");
     settlement
 }
 
-fn processor(v: &Vault) -> Processor {
+fn processor(v: &Vault) -> Processor<Raffle> {
     let receiver = PayoutReceiver {
         network: Network::Test,
         orchard: v
@@ -351,17 +356,20 @@ fn processor(v: &Vault) -> Processor {
             .to_raw_address_bytes(),
     };
     let ufvk = keys::unified_full_viewing_key(&v.fvk).expect("ufvk");
-    Processor::new(GameConfig {
-        params: GameParams::testnet(GENESIS),
-        vault_address: receiver.to_unified_address().expect("address"),
-        sealing_public_key: v.sealing_pk.clone(),
-        uivk: keys::encode_uivk(
-            &keys::unified_incoming_viewing_key(&ufvk),
-            &zecraft_vault::Params::TestNetwork,
-        ),
-        genesis_height: GENESIS,
-        initial_cache_zat: 0,
-    })
+    Processor::new(
+        Raffle,
+        GameConfig {
+            chain: ChainParams::testnet(GENESIS),
+            game: RaffleParams::default(),
+            vault_address: receiver.to_unified_address().expect("address"),
+            sealing_public_key: v.sealing_pk.clone(),
+            uivk: keys::encode_uivk(
+                &keys::unified_incoming_viewing_key(&ufvk),
+                &zecraft_vault::Params::TestNetwork,
+            ),
+            initial_carry_zat: 0,
+        },
+    )
 }
 
 fn refusal(result: Result<zecraft_keyholder::verify::Approved, KeyholderError>) -> String {
@@ -372,67 +380,62 @@ fn refusal(result: Result<zecraft_keyholder::verify::Approved, KeyholderError>) 
     }
 }
 
-fn drawn(tile: u8, cache_triggered: bool) -> RoundOutcome {
-    RoundOutcome::Drawn {
-        treasure_tile: tile,
-        cache_triggered,
-    }
-}
-
 #[test]
 fn honest_payout_is_approved_and_tampered_ones_are_refused() {
     let v = vault(1);
     let processor = processor(&v);
     let (alice, alice_memo) = player(&v, 10, 0, 3);
-    let (bob, bob_memo) = player(&v, 20, 0, 3);
-    let (mallory, _) = player(&v, 30, 0, 9);
-    let (_carol, carol_memo) = player(&v, 40, 1, 5);
-    // Vault notes: alice's and bob's digs, carol's round-1 dig, two float notes.
+    let (bob, bob_memo) = player(&v, 20, 0, 2);
+    let (dave, dave_memo) = player(&v, 50, 9, 1); // names round 9: refunded
+    let (mallory, _) = player(&v, 30, 0, 1);
+    let (_carol, carol_memo) = player(&v, 40, 1, 1);
+    // Vault notes: alice's, bob's and dave's entries, carol's round-1 entry,
+    // two float notes.
+    let enc = |m: &EntryMemo<Tickets>| m.encode(&FORMAT);
     let (notes, anchor) = vault_notes(
         &v.fvk,
         &[
-            (Scope::External, 500_000, alice_memo.encode()),
-            (Scope::External, 300_000, bob_memo.encode()),
-            (Scope::External, 150_000, carol_memo.encode()),
+            (Scope::External, 300_000, enc(&alice_memo)),
+            (Scope::External, 200_000, enc(&bob_memo)),
+            (Scope::External, 100_000, enc(&dave_memo)),
+            (Scope::External, 100_000, enc(&carol_memo)),
             (Scope::Internal, 50_000, [0xF6; 512]),
             (Scope::Internal, 1_200_000, [0xF6; 512]),
         ],
     );
-    let (alice_note, bob_note, carol_note, small_float, big_float) =
-        (&notes[0], &notes[1], &notes[2], &notes[3], &notes[4]);
+    let (alice_note, bob_note, dave_note, carol_note, small_float, big_float) = (
+        &notes[0], &notes[1], &notes[2], &notes[3], &notes[4], &notes[5],
+    );
     let chain = Db::open_in_memory().expect("db");
     let node = NodeDb::open_in_memory().expect("node db");
+    let entry = |value, memo, note, height| Entry {
+        value,
+        memo,
+        note,
+        height,
+    };
     let settlement = settle_round(
         &chain,
         &processor,
         &[
-            Dig {
-                value: 500_000,
-                memo: alice_memo.encode(),
-                note: alice_note,
-                height: GENESIS + 1,
-            },
-            Dig {
-                value: 300_000,
-                memo: bob_memo.encode(),
-                note: bob_note,
-                height: GENESIS + 2,
-            },
-            Dig {
-                value: 150_000,
-                memo: carol_memo.encode(),
-                note: carol_note,
-                height: GENESIS + 30, // round 1
-            },
+            entry(300_000, enc(&alice_memo), alice_note, GENESIS + 1),
+            entry(200_000, enc(&bob_memo), bob_note, GENESIS + 2),
+            entry(100_000, enc(&dave_memo), dave_note, GENESIS + 3),
+            entry(100_000, enc(&carol_memo), carol_note, GENESIS + 30), // round 1
         ],
-        drawn(3, false),
         0,
-        2,
     );
-    assert_eq!(settlement.payouts.len(), 2);
-    let (alice_net, bob_net) = (settlement.payouts[0].net, settlement.payouts[1].net);
-    assert_eq!((alice_net, bob_net), (464_062, 276_437));
-    assert_eq!(settlement.total_fees, 20_000, "2 dig fees + 2 output fees");
+    assert_eq!(settlement.payouts.len(), 2, "the winner and dave's refund");
+    assert_eq!(settlement.payouts[0].kind, PayoutKind::Win);
+    let winner = if settlement.payouts[0].sealed == alice_memo.sealed_receiver {
+        alice
+    } else {
+        assert_eq!(settlement.payouts[0].sealed, bob_memo.sealed_receiver);
+        bob
+    };
+    let (win_net, refund_net) = (settlement.payouts[0].net, settlement.payouts[1].net);
+    assert_eq!((win_net, refund_net), (490_000 - 5_000, 90_000));
+    assert_eq!(settlement.fees, 25_000, "3 entry fees + 2 output fees");
     let ctx = VerifyContext {
         now: 2,
         processor: &processor,
@@ -441,25 +444,26 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
         chain: &chain,
         node: &node,
     };
-    let digs = [alice_note, bob_note];
+    let spent = [alice_note, bob_note, dave_note];
+    let honest_outputs = [(winner, win_net), (dave, refund_net)];
 
-    // Honest: both digs spent, both winners paid, change returns to the vault.
-    let honest = payout_pczt(&v, &digs, anchor, &[(alice, alice_net), (bob, bob_net)]);
+    // Honest: every entry spent, the winner and the refund paid, change back.
+    let honest = payout_pczt(&v, &spent, anchor, &honest_outputs);
     let honest_bytes = honest.serialize().expect("serialize");
     let approved = verify_payout(&ctx, &honest_bytes, &[0]).expect("approved");
     assert_eq!(approved.payouts, 2);
     assert_eq!(approved.distinct_receivers, 2);
-    assert_eq!(approved.charged_inputs, 2);
+    assert_eq!(approved.charged_inputs, 3);
     assert_eq!(approved.float_inputs, 0);
     assert_eq!(approved.rounds, vec![0]);
     assert_eq!(
         approved.pending.len(),
-        2,
-        "two real Ironwood spends to sign"
+        3,
+        "three real Ironwood spends to sign"
     );
     assert_eq!(
         approved.fee, 15_000,
-        "3 actions x 5000 zat, within the 20,000 collected"
+        "3 actions x 5000 zat, within the 25,000 collected"
     );
 
     // A node whose chain view stalled refuses (review L3), and so does one
@@ -482,7 +486,12 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
     chain.set_chain_tip(GENESIS).expect("chain tip");
 
     // Redirected output: the amount still matches a payout.
-    let redirected = payout_pczt(&v, &digs, anchor, &[(mallory, alice_net), (bob, bob_net)]);
+    let redirected = payout_pczt(
+        &v,
+        &spent,
+        anchor,
+        &[(mallory, win_net), (dave, refund_net)],
+    );
     let i = output_index_of(&redirected, &mallory);
     assert_eq!(
         refusal(verify_payout(&ctx, &redirected.serialize().expect("ser"), &[0])),
@@ -490,19 +499,28 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
     );
 
     // Changed amount to the right receiver.
-    let short = payout_pczt(&v, &digs, anchor, &[(alice, alice_net - 1), (bob, bob_net)]);
-    let i = output_index_of(&short, &alice);
+    let short = payout_pczt(
+        &v,
+        &spent,
+        anchor,
+        &[(winner, win_net - 1), (dave, refund_net)],
+    );
+    let i = output_index_of(&short, &winner);
     assert_eq!(
         refusal(verify_payout(&ctx, &short.serialize().expect("ser"), &[0])),
-        format!("output {i}: amount 464,061 expected 464,062")
+        format!(
+            "output {i}: amount {} expected {}",
+            zat(win_net - 1),
+            zat(win_net)
+        )
     );
 
-    // Extra output.
+    // Extra output (paid from a float note, so the outputs still balance).
     let extra = payout_pczt(
         &v,
-        &digs,
+        &[alice_note, bob_note, dave_note, big_float],
         anchor,
-        &[(alice, alice_net), (bob, bob_net), (mallory, 10_000)],
+        &[(winner, win_net), (dave, refund_net), (mallory, 10_000)],
     );
     let i = output_index_of(&extra, &mallory);
     assert_eq!(
@@ -510,60 +528,60 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
         format!("output {i}: unexpected output of 10,000 zatoshis (not a payout of rounds [0] nor vault change)")
     );
 
-    // Missing output.
-    let missing = payout_pczt(&v, &digs, anchor, &[(alice, alice_net)]);
+    // Missing output: dave's refund is not paid.
+    let missing = payout_pczt(&v, &spent, anchor, &[(winner, win_net)]);
     assert_eq!(
         refusal(verify_payout(
             &ctx,
             &missing.serialize().expect("ser"),
             &[0]
         )),
-        "round 0 payout 1 (net 276,437) is not among the outputs"
+        "round 0 payout 1 (net 90,000) is not among the outputs"
     );
 
-    // Missing input: bob's dig note is not spent (a float note pays instead).
+    // Missing input: bob's entry note is not spent (a float note pays instead).
     let no_bob = payout_pczt(
         &v,
-        &[alice_note, big_float],
+        &[alice_note, dave_note, big_float],
         anchor,
-        &[(alice, alice_net), (bob, bob_net)],
+        &honest_outputs,
     );
     assert_eq!(
         refusal(verify_payout(&ctx, &no_bob.serialize().expect("ser"), &[0])),
         format!(
-            "dig note {}:1 of round 0 is not spent by the transaction",
+            "entry note {}:1 of round 0 is not spent by the transaction",
             "aa".repeat(32)
         )
     );
 
-    // Another round's dig note spent as if it were float.
-    let foreign_dig = payout_pczt(
+    // Another round's entry note spent as if it were float.
+    let foreign_entry = payout_pczt(
         &v,
-        &[alice_note, bob_note, carol_note],
+        &[alice_note, bob_note, dave_note, carol_note],
         anchor,
-        &[(alice, alice_net), (bob, bob_net)],
+        &honest_outputs,
     );
-    let i = spend_index_of(&foreign_dig, &carol_note.cmx);
+    let i = spend_index_of(&foreign_entry, &carol_note.cmx);
     assert_eq!(
         refusal(verify_payout(
             &ctx,
-            &foreign_dig.serialize().expect("ser"),
+            &foreign_entry.serialize().expect("ser"),
             &[0]
         )),
-        format!("input {i}: note is not a dig of rounds [0]")
+        format!("input {i}: note is not an entry of rounds [0]")
     );
 
     // A float note that is not needed.
     let needless = payout_pczt(
         &v,
-        &[alice_note, bob_note, small_float],
+        &[alice_note, bob_note, dave_note, small_float],
         anchor,
-        &[(alice, alice_net), (bob, bob_net)],
+        &honest_outputs,
     );
     let i = spend_index_of(&needless, &small_float.cmx);
     assert_eq!(
         refusal(verify_payout(&ctx, &needless.serialize().expect("ser"), &[0])),
-        format!("input {i}: float note not needed: the dig notes of rounds [0] cover the outputs and the fee")
+        format!("input {i}: float note not needed: the entry notes of rounds [0] cover the outputs and the fee")
     );
 
     // Unknown and duplicated rounds.
@@ -582,16 +600,9 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
 
     // Another vault's notes cannot be spent here.
     let other = vault(2);
-    let (other_notes, other_anchor) = vault_notes(
-        &other.fvk,
-        &[(Scope::External, 900_000, alice_memo.encode())],
-    );
-    let foreign = payout_pczt(
-        &other,
-        &[&other_notes[0]],
-        other_anchor,
-        &[(alice, alice_net), (bob, bob_net)],
-    );
+    let (other_notes, other_anchor) =
+        vault_notes(&other.fvk, &[(Scope::External, 900_000, enc(&alice_memo))]);
+    let foreign = payout_pczt(&other, &[&other_notes[0]], other_anchor, &honest_outputs);
     let reason = refusal(verify_payout(
         &ctx,
         &foreign.serialize().expect("ser"),
@@ -626,27 +637,26 @@ fn honest_payout_is_approved_and_tampered_ones_are_refused() {
     assert!(refusal(verify_payout(&ctx, b"not a pczt", &[0])).starts_with("PCZT does not parse: "));
 }
 
-/// A winning dig whose sealed receiver is junk (security review H1) must not
-/// block the round: its payout is unclaimable, the honest winner is paid,
-/// and the junk payout's value stays in the vault's change.
+/// A winning entry whose sealed receiver is junk (security review H1) must
+/// not block the round: its payout is unclaimable, the refund is paid, and
+/// the junk payout's value stays in the vault's change.
 #[test]
 fn a_junk_receiver_is_left_in_the_vault_and_the_round_still_pays() {
     let v = vault(5);
     let processor = processor(&v);
-    let (alice, alice_memo) = player(&v, 12, 0, 3);
-    let (mallory, _) = player(&v, 31, 0, 3);
-    let junk_memo = DigMemo {
+    let (alice, alice_memo) = player(&v, 12, 4, 1); // names round 4: refunded
+    let (mallory, _) = player(&v, 31, 0, 1);
+    let junk_memo = EntryMemo {
         round: 0,
-        tile: 3,
-        sealed_receiver: zecraft_core::memo::SealedReceiver::from_bytes(&[0x42; 92])
-            .expect("92 bytes"),
-        message: None,
+        payload: Tickets(2),
+        sealed_receiver: SealedReceiver::from_bytes(&[0x42; 92]).expect("92 bytes"),
     };
+    let enc = |m: &EntryMemo<Tickets>| m.encode(&FORMAT);
     let (notes, anchor) = vault_notes(
         &v.fvk,
         &[
-            (Scope::External, 500_000, alice_memo.encode()),
-            (Scope::External, 300_000, junk_memo.encode()),
+            (Scope::External, 100_000, enc(&alice_memo)),
+            (Scope::External, 200_000, enc(&junk_memo)),
         ],
     );
     let chain = Db::open_in_memory().expect("db");
@@ -655,33 +665,32 @@ fn a_junk_receiver_is_left_in_the_vault_and_the_round_still_pays() {
         &chain,
         &processor,
         &[
-            Dig {
-                value: 500_000,
-                memo: alice_memo.encode(),
+            Entry {
+                value: 100_000,
+                memo: enc(&alice_memo),
                 note: &notes[0],
                 height: GENESIS + 1,
             },
-            Dig {
-                value: 300_000,
-                memo: junk_memo.encode(),
+            Entry {
+                value: 200_000,
+                memo: enc(&junk_memo),
                 note: &notes[1],
                 height: GENESIS + 2,
             },
         ],
-        drawn(3, false),
         0,
-        2,
     );
     assert_eq!(
         settlement.payouts.len(),
         2,
-        "the junk dig is a valid winner"
+        "the junk entry wins; alice is refunded"
     );
-    let (alice_net, junk_net) = (settlement.payouts[0].net, settlement.payouts[1].net);
+    let (junk_net, alice_net) = (settlement.payouts[0].net, settlement.payouts[1].net);
     assert!(zecraft_engine::coordinator::payable_receiver(
         Network::Test,
+        &FORMAT,
         &v.sealing,
-        &settlement.payouts[1]
+        &settlement.payouts[0]
     )
     .is_err());
     let ctx = VerifyContext {
@@ -692,17 +701,17 @@ fn a_junk_receiver_is_left_in_the_vault_and_the_round_still_pays() {
         chain: &chain,
         node: &node,
     };
-    let digs = [&notes[0], &notes[1]];
+    let spent = [&notes[0], &notes[1]];
 
-    // Alice is paid; the junk payout's value stays in the change output.
-    let honest = payout_pczt(&v, &digs, anchor, &[(alice, alice_net)]);
+    // Alice is refunded; the junk payout's value stays in the change output.
+    let honest = payout_pczt(&v, &spent, anchor, &[(alice, alice_net)]);
     let approved = verify_payout(&ctx, &honest.serialize().expect("ser"), &[0]).expect("approved");
     assert_eq!(approved.payouts, 1);
 
     // Nobody may collect the unclaimable amount.
     let stolen = payout_pczt(
         &v,
-        &digs,
+        &spent,
         anchor,
         &[(alice, alice_net), (mallory, junk_net)],
     );
@@ -711,39 +720,37 @@ fn a_junk_receiver_is_left_in_the_vault_and_the_round_still_pays() {
 }
 
 #[test]
-fn cache_payout_may_use_float_notes_but_only_within_the_collected_fees() {
+fn a_carry_payout_may_use_float_notes_but_only_within_the_collected_fees() {
     let v = vault(3);
     let processor = processor(&v);
-    let (alice, alice_memo) = player(&v, 11, 0, 3);
+    let (alice, alice_memo) = player(&v, 11, 0, 1);
     let (notes, anchor) = vault_notes(
         &v.fvk,
         &[
-            (Scope::External, 100_000, alice_memo.encode()),
+            (Scope::External, 100_000, alice_memo.encode(&FORMAT)),
             (Scope::Internal, 1_200_000, [0xF6; 512]),
             (Scope::Internal, 600_000, [0xF6; 512]),
             (Scope::Internal, 600_000, [0xF6; 512]),
         ],
     );
-    let (dig, big, half_a, half_b) = (&notes[0], &notes[1], &notes[2], &notes[3]);
+    let (ticket, big, half_a, half_b) = (&notes[0], &notes[1], &notes[2], &notes[3]);
     let chain = Db::open_in_memory().expect("db");
     let node = NodeDb::open_in_memory().expect("node db");
-    // The Cache (1,000,000 carried in) triggers for the sole winner.
+    // 1,000,000 carried in; the sole ticket wins it.
     let settlement = settle_round(
         &chain,
         &processor,
-        &[Dig {
+        &[Entry {
             value: 100_000,
-            memo: alice_memo.encode(),
-            note: dig,
+            memo: alice_memo.encode(&FORMAT),
+            note: ticket,
             height: GENESIS + 1,
         }],
-        drawn(3, true),
         1_000_000,
-        2,
     );
     assert_eq!(settlement.payouts.len(), 1);
     assert_eq!(settlement.payouts[0].net, 1_090_000);
-    assert_eq!(settlement.total_fees, 10_000);
+    assert_eq!(settlement.fees, 10_000);
     let ctx = VerifyContext {
         now: 2,
         processor: &processor,
@@ -754,14 +761,14 @@ fn cache_payout_may_use_float_notes_but_only_within_the_collected_fees() {
     };
 
     // One float note: 2 spends, 2 outputs, fee 10,000 = collected. Approved.
-    let one_float = payout_pczt(&v, &[dig, big], anchor, &[(alice, 1_090_000)]);
+    let one_float = payout_pczt(&v, &[ticket, big], anchor, &[(alice, 1_090_000)]);
     let approved =
         verify_payout(&ctx, &one_float.serialize().expect("ser"), &[0]).expect("approved");
     assert_eq!(approved.float_inputs, 1);
     assert_eq!(approved.fee, 10_000);
 
     // Two float notes: 3 spends, fee 15,000 > 10,000 collected. Refused.
-    let two_floats = payout_pczt(&v, &[dig, half_a, half_b], anchor, &[(alice, 1_090_000)]);
+    let two_floats = payout_pczt(&v, &[ticket, half_a, half_b], anchor, &[(alice, 1_090_000)]);
     assert_eq!(
         refusal(verify_payout(
             &ctx,
@@ -772,27 +779,48 @@ fn cache_payout_may_use_float_notes_but_only_within_the_collected_fees() {
     );
 }
 
+/// A note the game keeps (an undecodable memo) is never a payout input and
+/// never float: the vault holds it for the carry.
 #[test]
-fn rounds_settled_under_rules_v1_are_not_signed() {
+fn kept_notes_are_never_spent_by_a_payout() {
     let v = vault(4);
     let processor = processor(&v);
-    let (alice, alice_memo) = player(&v, 12, 0, 3);
-    let (notes, anchor) = vault_notes(&v.fvk, &[(Scope::External, 500_000, alice_memo.encode())]);
+    let (alice, alice_memo) = player(&v, 21, 0, 1);
+    let (notes, anchor) = vault_notes(
+        &v.fvk,
+        &[
+            (Scope::External, 100_000, alice_memo.encode(&FORMAT)),
+            (Scope::External, 60_000, [0xF6; 512]),
+            (Scope::Internal, 50_000, [0xF6; 512]),
+        ],
+    );
+    // One ticket exactly pays its payout and the fee, so the coordinator
+    // adds a float note for the change output.
+    let (ticket, kept, float) = (&notes[0], &notes[1], &notes[2]);
     let chain = Db::open_in_memory().expect("db");
     let node = NodeDb::open_in_memory().expect("node db");
     let settlement = settle_round(
         &chain,
         &processor,
-        &[Dig {
-            value: 500_000,
-            memo: alice_memo.encode(),
-            note: &notes[0],
-            height: GENESIS + 1,
-        }],
-        drawn(3, false),
+        &[
+            Entry {
+                value: 100_000,
+                memo: alice_memo.encode(&FORMAT),
+                note: ticket,
+                height: GENESIS + 1,
+            },
+            Entry {
+                value: 60_000,
+                memo: [0xF6; 512],
+                note: kept,
+                height: GENESIS + 2,
+            },
+        ],
         0,
-        1,
     );
+    assert_eq!(settlement.carry_out, 60_000);
+    assert_eq!(settlement.payouts.len(), 1);
+    let net = settlement.payouts[0].net;
     let ctx = VerifyContext {
         now: 2,
         processor: &processor,
@@ -801,88 +829,16 @@ fn rounds_settled_under_rules_v1_are_not_signed() {
         chain: &chain,
         node: &node,
     };
-    let pczt = payout_pczt(
-        &v,
-        &[&notes[0]],
-        anchor,
-        &[(alice, settlement.payouts[0].net)],
-    );
-    assert_eq!(
-        refusal(verify_payout(&ctx, &pczt.serialize().expect("ser"), &[0])),
-        "round 0 was settled under rules version 1; this node only signs payouts of rules version 2 or later"
-    );
-}
-
-#[test]
-fn rules_v4_payouts_never_spend_shouts() {
-    let v = vault(4);
-    let mut processor_v4 = processor(&v);
-    {
-        // Rules v4 from genesis: text memos and Campfire both active.
-        let mut config = processor_v4.config().clone();
-        config.params.text_memo_activation_height = Some(GENESIS);
-        config.params.campfire = Some(zecraft_core::params::CampfireParams {
-            activation_height: GENESIS,
-            min_shout_zat: zecraft_core::params::MIN_SHOUT_ZAT,
-        });
-        config.validate().expect("valid v4 config");
-        processor_v4 = Processor::new(config);
-    }
-    let (alice, alice_memo) = player(&v, 21, 0, 3);
-    let alice_memo = alice_memo.with_message("for the fire").expect("message");
-    let shout = zecraft_core::memo::ShoutMemo::new("the night is long").expect("shout");
-    let (notes, anchor) = vault_notes(
-        &v.fvk,
-        &[
-            (Scope::External, 100_000, alice_memo.encode()),
-            (Scope::External, 60_000, shout.encode()),
-        ],
-    );
-    let (dig, shout_note) = (&notes[0], &notes[1]);
-    let chain = Db::open_in_memory().expect("db");
-    let node = NodeDb::open_in_memory().expect("node db");
-    let settlement = settle_round(
-        &chain,
-        &processor_v4,
-        &[
-            Dig {
-                value: 100_000,
-                memo: alice_memo.encode(),
-                note: dig,
-                height: GENESIS + 1,
-            },
-            Dig {
-                value: 60_000,
-                memo: shout.encode(),
-                note: shout_note,
-                height: GENESIS + 2,
-            },
-        ],
-        drawn(3, false),
-        0,
-        4,
-    );
-    assert_eq!(settlement.shouts, 60_000);
-    assert_eq!(settlement.shout_fees, 5_000);
-    assert_eq!(settlement.payouts.len(), 1);
-    let net = settlement.payouts[0].net;
-    let ctx = VerifyContext {
-        now: 2,
-        processor: &processor_v4,
-        fvk: &v.fvk,
-        sealing: &v.sealing,
-        chain: &chain,
-        node: &node,
-    };
-    // The honest payout spends only the dig.
-    let honest = payout_pczt(&v, &[dig], anchor, &[(alice, net)]);
+    let honest = payout_pczt(&v, &[ticket, float], anchor, &[(alice, net)]);
     verify_payout(&ctx, &honest.serialize().expect("ser"), &[0]).expect("approved");
-    // Spending the shout note too is refused: shouts are not payout inputs.
-    let with_shout = payout_pczt(&v, &[dig, shout_note], anchor, &[(alice, net)]);
-    let reason = refusal(verify_payout(
-        &ctx,
-        &with_shout.serialize().expect("ser"),
-        &[0],
-    ));
-    assert!(reason.starts_with("input "), "{reason}");
+    let with_kept = payout_pczt(&v, &[ticket, kept], anchor, &[(alice, net)]);
+    let i = spend_index_of(&with_kept, &kept.cmx);
+    assert_eq!(
+        refusal(verify_payout(
+            &ctx,
+            &with_kept.serialize().expect("ser"),
+            &[0]
+        )),
+        format!("input {i}: note is not an entry of rounds [0]")
+    );
 }

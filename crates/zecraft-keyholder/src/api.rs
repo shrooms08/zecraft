@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use zecraft_core::rules::Rules;
 use zecraft_engine::config::GameConfig;
 use zecraft_engine::processor::Processor;
 use zecraft_engine::store::Store;
@@ -25,11 +26,11 @@ use zecraft_engine::protocol::{
 };
 
 /// Shared state.
-pub struct AppState {
+pub struct AppState<R: Rules> {
     pub config: KeyholderConfig,
-    pub game: GameConfig,
+    pub game: GameConfig<R::Params>,
     /// Classifies this node's notes for payout verification.
-    pub processor: Processor,
+    pub processor: Processor<R>,
     pub identity: Identity,
     /// The DKG inbox (also served alone by `zecraft-keyholder dkg`).
     pub dkg: Arc<DkgNode>,
@@ -93,11 +94,11 @@ pub fn dkg_router(node: Arc<DkgNode>) -> Router {
 
 /// Builds the router.
 /// Builds the router; the DKG endpoints only when the config allows them.
-pub fn router(state: Arc<AppState>) -> Router {
+pub fn router<R: Rules>(state: Arc<AppState<R>>) -> Router {
     let app = Router::new()
-        .route("/v1/sign/request", post(sign_request))
-        .route("/v1/sign/round2", post(sign_round2))
-        .route("/v1/health", get(health))
+        .route("/v1/sign/request", post(sign_request::<R>))
+        .route("/v1/sign/round2", post(sign_round2::<R>))
+        .route("/v1/health", get(health::<R>))
         .with_state(state.clone());
     if state.config.dkg {
         app.merge(dkg_router(state.dkg.clone()))
@@ -138,7 +139,7 @@ async fn dkg_confirm(State(node): State<Arc<DkgNode>>, Json(env): Json<Envelope>
     }
 }
 
-fn refusal(state: &AppState, session: &protocol::SessionId, reason: String) -> Reply {
+fn refusal<R: Rules>(state: &AppState<R>, session: &protocol::SessionId, reason: String) -> Reply {
     tracing::warn!(session = %hex::encode(session), reason = %reason, "REFUSED to sign");
     match protocol::seal(
         &state.identity,
@@ -154,7 +155,10 @@ fn refusal(state: &AppState, session: &protocol::SessionId, reason: String) -> R
     }
 }
 
-async fn sign_request(State(state): State<Arc<AppState>>, Json(env): Json<Envelope>) -> Response {
+async fn sign_request<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
+    Json(env): Json<Envelope>,
+) -> Response {
     let opened = protocol::open::<SignRequest>(
         &env,
         &Expect {
@@ -229,7 +233,10 @@ async fn sign_request(State(state): State<Arc<AppState>>, Json(env): Json<Envelo
     }
 }
 
-async fn sign_round2(State(state): State<Arc<AppState>>, Json(env): Json<Envelope>) -> Response {
+async fn sign_round2<R: Rules>(
+    State(state): State<Arc<AppState<R>>>,
+    Json(env): Json<Envelope>,
+) -> Response {
     let opened = protocol::open::<SignPackages>(
         &env,
         &Expect {
@@ -272,7 +279,7 @@ async fn sign_round2(State(state): State<Arc<AppState>>, Json(env): Json<Envelop
     }
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Response {
+async fn health<R: Rules>(State(state): State<Arc<AppState<R>>>) -> Response {
     let keys = state.keys.read().await.clone();
     let (tip_height, settled_rounds) = state
         .chain

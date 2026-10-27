@@ -25,7 +25,7 @@ use zecraft_engine::api::{router, AppState};
 use zecraft_engine::beacon::{BeaconFetcher, FetchedBeacon, FixedBeacons};
 use zecraft_engine::chain::{ingest, ChainSource};
 use zecraft_engine::db::{PayoutRecord, PayoutState, PlanStatus};
-use zecraft_engine::decrypt::DigScanner;
+use zecraft_engine::decrypt::EntryScanner;
 use zecraft_engine::processor::Processor;
 use zecraft_engine::store::Store;
 use zecraft_engine::synthetic::SyntheticChain;
@@ -126,12 +126,12 @@ fn slow_proof() -> u64 {
 async fn engine_pass(
     store: Arc<Store>,
     mut source: StalledChain,
-    config: zecraft_engine::config::GameConfig,
+    config: zecraft_engine::config::GameConfig<zecraft_raffle::RaffleParams>,
     now: u64,
 ) -> Result<(), EngineError> {
-    let scanner = DigScanner::new(config.incoming_viewing_key()?);
-    ingest(&mut source, &store, &scanner, &config).await?;
-    let mut processor = Processor::new(config);
+    let scanner = EntryScanner::new(config.incoming_viewing_key()?);
+    ingest(&mut source, &store, &scanner, &config.chain).await?;
+    let mut processor = Processor::new(zecraft_raffle::Raffle, config);
     let mut beacons = StalledBeacons(fixture_beacons());
     processor.process(&store, &mut beacons, now).await?;
 
@@ -189,29 +189,28 @@ async fn api_reads_stay_fast_while_the_pass_is_stalled() {
     let dir = tempfile::tempdir().expect("dir");
     let store = Arc::new(Store::open(&dir.path().join("engine.sqlite")).expect("store"));
     let Scenario { vault, mut chain } = scenario(0);
-    let config = vault.config(GENESIS);
+    let config = common::config(&vault);
 
     // Most of the chain is already stored; the stalled pass fetches the
     // round's last blocks (and its dig transactions) through the stall.
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let mut warm = Earlier {
         chain: &mut chain,
         tip: GENESIS + 6,
     };
-    ingest(&mut warm, &store, &scanner, &config)
+    ingest(&mut warm, &store, &scanner, &config.chain)
         .await
         .expect("warm ingest");
 
     let (events, _) = broadcast::channel(8);
     let state = Arc::new(AppState {
-        processor: Processor::new(config.clone()),
+        processor: Processor::new(zecraft_raffle::Raffle, config.clone()),
         store: store.clone(),
         events,
         started: Instant::now(),
         ledger: None,
         chain_servers: None,
-        digging: true,
-        demo_digs: false,
+        entries_open: true,
         stream_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
             zecraft_engine::api::MAX_STREAMS,
         )),
@@ -222,7 +221,7 @@ async fn api_reads_stay_fast_while_the_pass_is_stalled() {
     });
     let app = router(state, &[]);
 
-    let beacon_time = start_time(&config.params) + 600 + 900;
+    let beacon_time = start_time(&config.chain) + 600 + 900;
     let pass = tokio::spawn(engine_pass(
         store.clone(),
         StalledChain(chain),

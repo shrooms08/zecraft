@@ -1,7 +1,7 @@
 [package]
 name = "zecraft-verify"
 version = "0.1.0"
-description = "Independent verifier for Zeek rounds and win proofs (native and wasm32; the CLI talks to any lightwalletd)"
+description = "Independent verifier for Zecraft rounds and win proofs, generic over a game's Rules (native and wasm32; the cli feature talks to any lightwalletd)"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,11 +9,6 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
-
-[[bin]]
-name = "zecraft-verify"
-path = "src/bin/zecraft-verify.rs"
-required-features = ["cli"]
 
 [dependencies]
 zecraft-core = { path = "../zecraft-core" }

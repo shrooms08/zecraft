@@ -10,10 +10,8 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use zecraft_core::beacon::{Beacon, Randomness};
-use zecraft_core::digs::ReceivedNote;
-use zecraft_core::settle::{RoundOutcome, Settlement};
-use zecraft_core::timing::TimingVerdict;
+use zecraft_core::draw::{Beacon, Randomness, TimingVerdict};
+use zecraft_core::rules::{ReceivedNote, Settlement};
 
 use crate::error::EngineError;
 
@@ -21,8 +19,8 @@ use crate::error::EngineError;
 /// writer's checkpoint, or a second writer such as `payout-recover`).
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Schema version written to `meta`. Version 2 added `notes.cmx`.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Schema version written to `meta`.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// A stored block header summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,12 +223,55 @@ pub struct SettlementRow {
     pub drand_round: u64,
     pub beacon_time: u64,
     pub timing: TimingVerdict,
-    pub outcome: RoundOutcome,
+    /// Whether the timing rule voided the round.
+    pub voided: bool,
+    /// The game's settlement (its outcome as JSON).
     pub settlement: Settlement,
     pub status: PlanStatus,
-    /// Rules the settlement was computed under (1 or 2); rows written before
-    /// rules v2 existed are version 1.
-    pub rules_version: u32,
+}
+
+/// Whether an entry took part in its round's draw or was refunded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Valid,
+    Refund,
+}
+
+impl EntryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::Valid => "valid",
+            EntryKind::Refund => "refund",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, EngineError> {
+        match s {
+            "valid" => Ok(EntryKind::Valid),
+            "refund" => Ok(EntryKind::Refund),
+            other => Err(EngineError::Corrupt(format!(
+                "unknown entry kind `{other}`"
+            ))),
+        }
+    }
+}
+
+/// A decoded entry of a settled round, stored generically: whatever the
+/// game, an entry is a note with a payload and a sealed receiver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryRow {
+    pub round: u32,
+    pub height: u32,
+    /// Display-hex txid.
+    pub txid: String,
+    pub action_index: u16,
+    pub value: u64,
+    /// The game payload's bytes, as decoded from the memo.
+    pub payload: Vec<u8>,
+    /// The 92-byte sealed payout receiver.
+    pub sealed_receiver: Vec<u8>,
+    pub kind: EntryKind,
 }
 
 /// The engine database.
@@ -351,10 +392,20 @@ impl Db {
                  drand_round INTEGER NOT NULL,
                  beacon_time INTEGER NOT NULL,
                  timing TEXT NOT NULL,
-                 outcome TEXT NOT NULL,
+                 voided INTEGER NOT NULL,
                  settlement TEXT NOT NULL,
-                 status TEXT NOT NULL,
-                 rules_version INTEGER NOT NULL DEFAULT 1
+                 status TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS entries (
+                 round INTEGER NOT NULL,
+                 height INTEGER NOT NULL,
+                 txid TEXT NOT NULL,
+                 action_index INTEGER NOT NULL,
+                 value INTEGER NOT NULL,
+                 payload BLOB NOT NULL,
+                 sealed_receiver BLOB NOT NULL,
+                 kind TEXT NOT NULL,
+                 PRIMARY KEY (round, txid, action_index)
              );
              CREATE TABLE IF NOT EXISTS payout_openings (
                  round INTEGER PRIMARY KEY,
@@ -399,16 +450,7 @@ impl Db {
             [],
             |r| r.get(0),
         )?;
-        if stored == "1" {
-            // Version 1 → 2: note commitments are recorded; existing rows are
-            // backfilled from their transactions by the chain follower.
-            conn.execute_batch(
-                "ALTER TABLE notes ADD COLUMN cmx BLOB;
-                 ALTER TABLE settlements ADD COLUMN rules_version INTEGER NOT NULL DEFAULT 1;
-                 UPDATE meta SET value = '2' WHERE key = 'schema_version';",
-            )?;
-            tracing::info!("engine database migrated from schema 1 to 2 (note commitments)");
-        } else if stored != SCHEMA_VERSION.to_string() {
+        if stored != SCHEMA_VERSION.to_string() {
             return Err(EngineError::Corrupt(format!(
                 "schema version {stored} is not supported (expected {SCHEMA_VERSION})"
             )));
@@ -976,9 +1018,8 @@ impl Db {
         let json = |v: &dyn erased::Ser| v.to_json();
         self.conn.execute(
             "INSERT INTO settlements (round, settled_at_height, start_block_time,
-                 post_close_block_times, drand_round, beacon_time, timing, outcome, settlement, status,
-                 rules_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 post_close_block_times, drand_round, beacon_time, timing, voided, settlement, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 row.round,
                 row.settled_at_height,
@@ -987,10 +1028,9 @@ impl Db {
                 row.drand_round,
                 row.beacon_time,
                 json(&row.timing)?,
-                json(&row.outcome)?,
+                row.voided,
                 json(&row.settlement)?,
-                row.status.as_str(),
-                row.rules_version
+                row.status.as_str()
             ],
         )?;
         Ok(())
@@ -1002,7 +1042,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT settled_at_height, start_block_time, post_close_block_times, drand_round,
-                        beacon_time, timing, outcome, settlement, status, rules_version
+                        beacon_time, timing, voided, settlement, status
                  FROM settlements WHERE round = ?1",
                 params![round],
                 |r| {
@@ -1013,10 +1053,9 @@ impl Db {
                         r.get::<_, u64>(3)?,
                         r.get::<_, u64>(4)?,
                         r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
+                        r.get::<_, bool>(6)?,
                         r.get::<_, String>(7)?,
                         r.get::<_, String>(8)?,
-                        r.get::<_, u32>(9)?,
                     ))
                 },
             )
@@ -1029,10 +1068,9 @@ impl Db {
                 drand_round,
                 beacon_time,
                 timing,
-                outcome,
+                voided,
                 settlement,
                 status,
-                rules_version,
             )| {
                 Ok(SettlementRow {
                     round,
@@ -1042,14 +1080,68 @@ impl Db {
                     drand_round,
                     beacon_time,
                     timing: erased::de(&timing)?,
-                    outcome: erased::de(&outcome)?,
+                    voided,
                     settlement: erased::de(&settlement)?,
                     status: PlanStatus::parse(&status)?,
-                    rules_version,
                 })
             },
         )
         .transpose()
+    }
+
+    /// Stores the entries of a settled round.
+    pub fn insert_entries(&self, entries: &[EntryRow]) -> Result<(), EngineError> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO entries (round, height, txid, action_index, value, payload, sealed_receiver, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for e in entries {
+            stmt.execute(params![
+                e.round,
+                e.height,
+                e.txid,
+                e.action_index,
+                e.value,
+                e.payload,
+                e.sealed_receiver,
+                e.kind.as_str()
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// The stored entries of `round`, in chain order.
+    pub fn entries(&self, round: u32) -> Result<Vec<EntryRow>, EngineError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT height, txid, action_index, value, payload, sealed_receiver, kind
+             FROM entries WHERE round = ?1 ORDER BY height, txid, action_index",
+        )?;
+        let rows = stmt.query_map(params![round], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u16>(2)?,
+                r.get::<_, u64>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, Vec<u8>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (height, txid, action_index, value, payload, sealed_receiver, kind) = row?;
+            out.push(EntryRow {
+                round,
+                height,
+                txid,
+                action_index,
+                value,
+                payload,
+                sealed_receiver,
+                kind: EntryKind::parse(&kind)?,
+            });
+        }
+        Ok(out)
     }
 
     /// The highest settled round.
@@ -1212,6 +1304,11 @@ impl Db {
             params![height],
         )?;
         tx.execute(
+            "DELETE FROM entries WHERE round IN
+             (SELECT round FROM settlements WHERE settled_at_height >= ?1)",
+            params![height],
+        )?;
+        tx.execute(
             "DELETE FROM settlements WHERE settled_at_height >= ?1",
             params![height],
         )?;
@@ -1276,11 +1373,11 @@ impl Db {
         }
         let mut stmt = self.conn.prepare(
             "SELECT round, settled_at_height, start_block_time, post_close_block_times, drand_round,
-                    beacon_time, timing, outcome, settlement, status, rules_version FROM settlements ORDER BY round",
+                    beacon_time, timing, voided, settlement, status FROM settlements ORDER BY round",
         )?;
         for row in stmt.query_map([], |r| {
             Ok(format!(
-                "settlement {} {} {} {} {} {} {} {} {} {} {}\n",
+                "settlement {} {} {} {} {} {} {} {} {} {}\n",
                 r.get::<_, u32>(0)?,
                 r.get::<_, u32>(1)?,
                 r.get::<_, u64>(2)?,
@@ -1288,10 +1385,28 @@ impl Db {
                 r.get::<_, u64>(4)?,
                 r.get::<_, u64>(5)?,
                 r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, bool>(7)?,
                 r.get::<_, String>(8)?,
-                r.get::<_, String>(9)?,
-                r.get::<_, u32>(10)?
+                r.get::<_, String>(9)?
+            ))
+        })? {
+            out.push_str(&row?);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT round, height, txid, action_index, value, hex(payload), hex(sealed_receiver), kind
+             FROM entries ORDER BY round, height, txid, action_index",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok(format!(
+                "entry {} {} {} {} {} {} {} {}\n",
+                r.get::<_, u32>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, u16>(3)?,
+                r.get::<_, u64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?
             ))
         })? {
             out.push_str(&row?);
@@ -1377,45 +1492,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_1_is_migrated_in_place() {
+    fn unknown_schema_versions_are_refused() {
         let conn = Connection::open_in_memory().expect("conn");
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta VALUES ('schema_version', '1');
-             CREATE TABLE notes (
-                 id INTEGER PRIMARY KEY, txid BLOB NOT NULL, action_index INTEGER NOT NULL,
-                 pool TEXT NOT NULL, height INTEGER NOT NULL, block_time INTEGER NOT NULL,
-                 value INTEGER NOT NULL, memo BLOB NOT NULL, UNIQUE (txid, action_index, pool));
-             CREATE TABLE settlements (
-                 round INTEGER PRIMARY KEY, settled_at_height INTEGER NOT NULL,
-                 start_block_time INTEGER NOT NULL, post_close_block_times TEXT NOT NULL,
-                 drand_round INTEGER NOT NULL, beacon_time INTEGER NOT NULL, timing TEXT NOT NULL,
-                 outcome TEXT NOT NULL, settlement TEXT NOT NULL, status TEXT NOT NULL);
-             INSERT INTO notes (txid, action_index, pool, height, block_time, value, memo)
-                 VALUES (x'00', 0, 'ironwood', 5, 1, 7, x'ff');",
+             INSERT INTO meta VALUES ('schema_version', '2');",
         )
-        .expect("v1 schema");
-        let db = Db::init(conn).expect("migrate");
-        assert_eq!(db.meta("schema_version").expect("meta"), Some("2".into()));
-        assert_eq!(
-            db.conn
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('settlements') WHERE name = 'rules_version'",
-                    [],
-                    |r| r.get::<_, u32>(0)
-                )
-                .expect("column"),
-            1,
-            "old settlement rows read back as rules version 1"
-        );
-        // The v1 txid above is 1 byte, so the row is reported as corrupt when
-        // read; the migration itself only adds the column.
-        assert_eq!(
-            db.conn
-                .query_row("SELECT count(*) FROM notes WHERE cmx IS NULL", [], |r| r
-                    .get::<_, u32>(0))
-                .expect("count"),
-            1
-        );
+        .expect("meta");
+        assert!(matches!(Db::init(conn), Err(EngineError::Corrupt(_))));
     }
 }

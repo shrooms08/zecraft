@@ -1,17 +1,20 @@
 //! The five round checks.
 //!
 //! 1. **Beacon**: the drand quicknet BLS signature verifies (drand
-//!    `bls-unchained-g1-rfc9380`, see `zecraft_core::beacon`), and the drand
-//!    round is the one the rules bind from the time of the window's first
-//!    block, read from the chain.
-//! 2. **Digs**: every compact block of the window is trial-decrypted with
+//!    `bls-unchained-g1-rfc9380`, see `zecraft_core::draw::beacon`), and the
+//!    drand round is the one the rules bind from the time of the window's
+//!    first block, read from the chain. The bundle's chain and game
+//!    parameters must equal the published configuration.
+//! 2. **Entries**: every compact block of the window is trial-decrypted with
 //!    the game's public UIVK; every note found is completed from its full
 //!    transaction (value, memo); the set must equal the bundle's notes
-//!    exactly, so no dig is hidden and none is invented.
+//!    exactly, so no entry is hidden and none is invented.
 //! 3. **Timing**: the median-time-past of the blocks after the window, read
 //!    from the chain, is recomputed against the beacon's publication time.
-//! 4. **Settlement**: recomputed with `zecraft-core` from the bundle (whose
-//!    inputs checks 1 to 3 tied to the chain) and compared byte for byte.
+//! 4. **Settlement**: recomputed with the game's rules through
+//!    `zecraft_core::proof::recompute` (which enforces the kit's settlement
+//!    invariants) from the bundle, whose inputs checks 1 to 3 tied to the
+//!    chain, and compared byte for byte. The game's draw is part of it.
 //! 5. **Payout**: the payout transaction is mined (its txid is in the
 //!    compact block at the claimed height), its Ironwood bundle verifies
 //!    (Halo2 proof with the Orchard-protocol verifying key, spend
@@ -35,14 +38,10 @@ use zcash_keys::keys::UnifiedIncomingViewingKey;
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
-use zecraft_core::beacon;
-use zecraft_core::digs::ReceivedNote;
-use zecraft_core::params::{GameParams, Network};
-use zecraft_core::proof::{self, PayoutOpening, ProofBundle};
-use zecraft_core::random;
-use zecraft_core::rounds;
-use zecraft_core::settle::RoundOutcome;
-use zecraft_core::timing;
+use zecraft_core::draw::{self as beacon, timing};
+use zecraft_core::params::{ChainParams, Network};
+use zecraft_core::proof::{self, PayoutOpening, ProofBundle, UnclaimablePayout};
+use zecraft_core::rules::{ReceivedNote, Rules, Settlement};
 
 use crate::chain::{parse_tx, txid_bytes, Blocks, MinedTx};
 use crate::report::{CheckId, CheckResult, CheckStatus, RoundReport};
@@ -59,16 +58,17 @@ pub enum VerifyError {
 /// The game's public configuration as the verifier trusts it (from the
 /// committed config file, or the engine's `/v1/config`).
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct PublicConfig {
-    pub params: GameParams,
+pub struct PublicConfig<P> {
+    pub chain: ChainParams,
+    pub game: P,
     pub vault_address: String,
     pub uivk: String,
 }
 
-impl PublicConfig {
+impl<P> PublicConfig<P> {
     /// The vault's external Orchard-protocol incoming viewing key.
     pub fn ivk(&self) -> Result<PreparedIncomingViewingKey, VerifyError> {
-        let uivk = match self.params.network {
+        let uivk = match self.chain.network {
             Network::Main => UnifiedIncomingViewingKey::decode(&MAIN_NETWORK, &self.uivk),
             Network::Test => UnifiedIncomingViewingKey::decode(&TEST_NETWORK, &self.uivk),
         }
@@ -89,11 +89,11 @@ pub fn verifying_key() -> &'static VerifyingKey {
 
 /// Heights of the compact blocks the checks need (inclusive): the window
 /// and the `mtp_window` blocks after it.
-pub fn block_range(bundle: &ProofBundle) -> (u32, u32) {
+pub fn block_range<P>(bundle: &ProofBundle<P>) -> (u32, u32) {
     let end = bundle
         .window
         .end
-        .saturating_add(bundle.params.mtp_window)
+        .saturating_add(bundle.chain.mtp_window)
         .saturating_sub(1);
     (bundle.window.start, end)
 }
@@ -144,8 +144,8 @@ fn scan_actions(
 
 /// Phase 1: trial-decrypts every compact block of the window with the
 /// public UIVK.
-pub fn scan_window(
-    bundle: &ProofBundle,
+pub fn scan_window<P>(
+    bundle: &ProofBundle<P>,
     ivk: &PreparedIncomingViewingKey,
     blocks: &Blocks,
 ) -> Vec<Hit> {
@@ -167,7 +167,7 @@ pub fn scan_window(
 
 /// Phase 2 input: the full transactions to fetch (display hex): every
 /// transaction with a hit, and the payout transaction when openings exist.
-pub fn transactions_to_fetch(bundle: &ProofBundle, hits: &[Hit]) -> Vec<String> {
+pub fn transactions_to_fetch<P>(bundle: &ProofBundle<P>, hits: &[Hit]) -> Vec<String> {
     let mut txids: BTreeSet<String> = hits.iter().map(|h| h.txid.clone()).collect();
     if let Some(openings) = &bundle.payout_openings {
         txids.insert(openings.txid.clone());
@@ -176,14 +176,15 @@ pub fn transactions_to_fetch(bundle: &ProofBundle, hits: &[Hit]) -> Vec<String> 
 }
 
 /// Height of the block that must hold the payout transaction, if any.
-pub fn payout_height(bundle: &ProofBundle) -> Option<u32> {
+pub fn payout_height<P>(bundle: &ProofBundle<P>) -> Option<u32> {
     bundle.payout_openings.as_ref().map(|o| o.mined_height)
 }
 
 /// Everything the checks read.
-pub struct RoundInput<'a> {
-    pub config: &'a PublicConfig,
-    pub bundle: &'a ProofBundle,
+pub struct RoundInput<'a, R: Rules> {
+    pub rules: &'a R,
+    pub config: &'a PublicConfig<R::Params>,
+    pub bundle: &'a ProofBundle<R::Params>,
     pub blocks: &'a Blocks,
     /// Full transactions by display txid.
     pub txs: &'a BTreeMap<String, MinedTx>,
@@ -191,17 +192,16 @@ pub struct RoundInput<'a> {
 }
 
 /// Runs the five checks.
-pub fn verify_round(input: &RoundInput<'_>) -> RoundReport {
+pub fn verify_round<R: Rules>(input: &RoundInput<'_, R>) -> RoundReport {
     let hits = scan_window(input.bundle, input.ivk, input.blocks);
     RoundReport {
         round: input.bundle.round,
         bundle_version: input.bundle.version,
-        rules_version: input.bundle.claimed_rules_version(),
         checks: vec![
             check_beacon(input),
-            check_digs(input, &hits),
+            check_entries(input, &hits),
             check_timing(input),
-            check_settlement(input.bundle),
+            check_settlement(input.rules, input.bundle),
             check_payout(input),
         ],
     }
@@ -211,87 +211,37 @@ fn fail(id: CheckId, summary: impl Into<String>) -> CheckResult {
     CheckResult::new(id, CheckStatus::Fail, summary)
 }
 
-/// The parameters that must agree between the bundle and the public config
-/// (the bundle may legitimately omit later rules' fields for older rounds).
-pub(crate) fn params_agree(bundle: &GameParams, public: &GameParams) -> Result<(), String> {
-    let pairs = [
-        (
-            "network",
-            format!("{:?}", bundle.network),
-            format!("{:?}", public.network),
-        ),
-        (
-            "genesis_height",
-            bundle.genesis_height.to_string(),
-            public.genesis_height.to_string(),
-        ),
-        (
-            "blocks_per_round",
-            bundle.blocks_per_round.to_string(),
-            public.blocks_per_round.to_string(),
-        ),
-        (
-            "rake_bps",
-            bundle.rake_bps.to_string(),
-            public.rake_bps.to_string(),
-        ),
-        (
-            "cache_odds",
-            bundle.cache_odds.to_string(),
-            public.cache_odds.to_string(),
-        ),
-        (
-            "min_dig_zat",
-            bundle.min_dig_zat.to_string(),
-            public.min_dig_zat.to_string(),
-        ),
-        (
-            "marginal_fee_zat",
-            bundle.marginal_fee_zat.to_string(),
-            public.marginal_fee_zat.to_string(),
-        ),
-        (
-            "drand public key",
-            bundle.drand.public_key.clone(),
-            public.drand.public_key.clone(),
-        ),
-        (
-            "drand genesis",
-            bundle.drand.genesis_time.to_string(),
-            public.drand.genesis_time.to_string(),
-        ),
-        (
-            "drand period",
-            bundle.drand.period_secs.to_string(),
-            public.drand.period_secs.to_string(),
-        ),
-        (
-            "reveal_delay_secs",
-            bundle.reveal_delay_secs.to_string(),
-            public.reveal_delay_secs.to_string(),
-        ),
-        (
-            "mtp_window",
-            bundle.mtp_window.to_string(),
-            public.mtp_window.to_string(),
-        ),
-    ];
-    for (name, b, p) in pairs {
-        if b != p {
-            return Err(format!("{name}: bundle {b}, public config {p}"));
-        }
+/// The parameters that must agree between the bundle and the public
+/// configuration: all of them.
+pub(crate) fn params_agree<P: PartialEq + serde::Serialize>(
+    bundle: &ProofBundle<P>,
+    public: &PublicConfig<P>,
+) -> Result<(), String> {
+    if bundle.chain != public.chain {
+        return Err(format!(
+            "chain parameters: bundle {}, public config {}",
+            serde_json::to_string(&bundle.chain).unwrap_or_default(),
+            serde_json::to_string(&public.chain).unwrap_or_default()
+        ));
+    }
+    if bundle.game != public.game {
+        return Err(format!(
+            "game parameters: bundle {}, public config {}",
+            serde_json::to_string(&bundle.game).unwrap_or_default(),
+            serde_json::to_string(&public.game).unwrap_or_default()
+        ));
     }
     Ok(())
 }
 
-fn check_beacon(input: &RoundInput<'_>) -> CheckResult {
+fn check_beacon<R: Rules>(input: &RoundInput<'_, R>) -> CheckResult {
     let id = CheckId::Beacon;
     let bundle = input.bundle;
-    let params = &bundle.params;
-    if let Err(e) = params_agree(params, &input.config.params) {
+    let params = &bundle.chain;
+    if let Err(e) = params_agree(bundle, input.config) {
         return fail(
             id,
-            "The bundle's game rules differ from the published configuration.",
+            "The bundle's rules differ from the published configuration.",
         )
         .with(e);
     }
@@ -327,49 +277,34 @@ fn check_beacon(input: &RoundInput<'_>) -> CheckResult {
             bundle.drand_round
         ));
     }
-    match bundle.outcome {
-        RoundOutcome::Voided => CheckResult::new(
+    if proof::is_voided(&bundle.timing) {
+        return CheckResult::new(
             id,
             CheckStatus::Pass,
             "The round was voided by the timing rule, so no beacon decides it (check 3 confirms the voiding).",
         )
-        .with(format!("bound drand round {drand_round} (not used)")),
-        RoundOutcome::Drawn { treasure_tile, cache_triggered } => {
-            let Some(b) = &bundle.beacon else {
-                return fail(id, "A drawn round must include its beacon.");
-            };
-            if b.round != drand_round {
-                return fail(id, "The beacon is for the wrong drand round.")
-                    .with(format!("beacon round {}, bound round {drand_round}", b.round));
-            }
-            let randomness = match beacon::verify_beacon(&params.drand, b) {
-                Ok(r) => r,
-                Err(e) => {
-                    return fail(id, "The beacon's BLS signature does not verify against drand quicknet.")
-                        .with(e.to_string())
-                }
-            };
-            if bundle.randomness != Some(randomness) {
-                return fail(id, "The bundle's randomness does not come from this beacon.");
-            }
-            let tile = random::treasure_tile(bundle.round, &randomness);
-            let cache = random::cache_triggers(params, bundle.round, &randomness);
-            match (tile, cache) {
-                (Ok(tile), Ok(cache)) if tile == treasure_tile && cache == cache_triggered => {
-                    CheckResult::new(
-                        id,
-                        CheckStatus::Pass,
-                        format!("drand quicknet round {drand_round} is genuine and is the one the rules bind; it puts the treasure on tile {tile}."),
-                    )
-                    .with(format!("round start block {} nTime {start_time}", bundle.window.start))
-                    .with(format!("BLS signature verified against the quicknet public key; cache triggered: {cache}"))
-                }
-                (Ok(tile), Ok(cache)) => fail(id, "The bundle's draw does not follow from the beacon.").with(format!(
-                    "recomputed tile {tile} cache {cache}; bundle tile {treasure_tile} cache {cache_triggered}"
-                )),
-                (Err(e), _) | (_, Err(e)) => fail(id, "The draw cannot be recomputed.").with(e.to_string()),
-            }
-        }
+        .with(format!("bound drand round {drand_round} (not used)"));
+    }
+    let Some(b) = &bundle.beacon else {
+        return fail(id, "A drawn round must include its beacon.");
+    };
+    if b.round != drand_round {
+        return fail(id, "The beacon is for the wrong drand round.").with(format!(
+            "beacon round {}, bound round {drand_round}",
+            b.round
+        ));
+    }
+    match beacon::verify_beacon(&params.drand, b) {
+        Ok(randomness) if bundle.randomness == Some(randomness) => CheckResult::new(
+            id,
+            CheckStatus::Pass,
+            format!("drand quicknet round {drand_round} is genuine and is the one the rules bind; check 4 recomputes the draw from it."),
+        )
+        .with(format!("round start block {} nTime {start_time}", bundle.window.start))
+        .with("BLS signature verified against the quicknet public key"),
+        Ok(_) => fail(id, "The bundle's randomness does not come from this beacon."),
+        Err(e) => fail(id, "The beacon's BLS signature does not verify against drand quicknet.")
+            .with(e.to_string()),
     }
 }
 
@@ -377,8 +312,8 @@ fn note_key(n: &ReceivedNote) -> (String, u16) {
     (n.txid.clone(), n.output_index)
 }
 
-fn check_digs(input: &RoundInput<'_>, hits: &[Hit]) -> CheckResult {
-    let id = CheckId::Digs;
+fn check_entries<R: Rules>(input: &RoundInput<'_, R>, hits: &[Hit]) -> CheckResult {
+    let id = CheckId::Entries;
     let bundle = input.bundle;
     let window = bundle.window;
     for height in window.start..window.end {
@@ -397,7 +332,7 @@ fn check_digs(input: &RoundInput<'_>, hits: &[Hit]) -> CheckResult {
             return fail(id, "A transaction paying the vault could not be fetched.")
                 .with(hit.txid.clone());
         };
-        let tx = match parse_tx(bundle.params.network, &hit.txid, mined) {
+        let tx = match parse_tx(bundle.chain.network, &hit.txid, mined) {
             Ok(tx) => tx,
             Err(e) => {
                 return fail(id, "A transaction paying the vault does not parse.")
@@ -458,7 +393,7 @@ fn check_digs(input: &RoundInput<'_>, hits: &[Hit]) -> CheckResult {
     if !hidden.is_empty() || !invented.is_empty() || !altered.is_empty() {
         let mut result = fail(
             id,
-            "The bundle's digs do not match what the vault received on chain.",
+            "The bundle's entries do not match what the vault received on chain.",
         );
         if !hidden.is_empty() {
             result = result.with(format!(
@@ -494,10 +429,10 @@ fn check_digs(input: &RoundInput<'_>, hits: &[Hit]) -> CheckResult {
     .with(format!("{} blocks trial-decrypted with the public UIVK; {} zatoshis in total", window.end - window.start, total))
 }
 
-fn check_timing(input: &RoundInput<'_>) -> CheckResult {
+fn check_timing<R: Rules>(input: &RoundInput<'_, R>) -> CheckResult {
     let id = CheckId::Timing;
     let bundle = input.bundle;
-    let params = &bundle.params;
+    let params = &bundle.chain;
     let mut times = Vec::with_capacity(bundle.post_close_block_times.len());
     for offset in 0..params.mtp_window {
         let height = bundle.window.end + offset;
@@ -534,7 +469,7 @@ fn check_timing(input: &RoundInput<'_>) -> CheckResult {
                 id,
                 CheckStatus::Pass,
                 if safe {
-                    "The round closed safely before the beacon was published, so nobody could know the treasure tile while digging."
+                    "The round closed safely before the beacon was published, so nobody could know the outcome while entering."
                 } else {
                     "The round closed too late relative to the beacon, so it was correctly voided and refunded."
                 },
@@ -549,9 +484,12 @@ fn check_timing(input: &RoundInput<'_>) -> CheckResult {
     }
 }
 
-pub(crate) fn check_settlement(bundle: &ProofBundle) -> CheckResult {
+pub(crate) fn check_settlement<R: Rules>(
+    rules: &R,
+    bundle: &ProofBundle<R::Params>,
+) -> CheckResult {
     let id = CheckId::Settlement;
-    match proof::recompute(bundle) {
+    match proof::recompute(rules, bundle) {
         Ok(recomputed) => {
             let ours = serde_json::to_vec(&recomputed).unwrap_or_default();
             let theirs = serde_json::to_vec(&bundle.settlement).unwrap_or_default();
@@ -561,11 +499,12 @@ pub(crate) fn check_settlement(bundle: &ProofBundle) -> CheckResult {
                     id,
                     CheckStatus::Pass,
                     format!(
-                        "Recomputing the round from its digs gives exactly the published result: {} paid out to {} winner(s), Deep Cache {} → {}.",
-                        s.total_paid, s.winners, s.previous_cache, s.new_cache
+                        "Recomputing the round from its entries gives exactly the published result: {} paid in {} output(s), carry {} → {}.",
+                        s.paid, s.payouts.len(), s.carry_in, s.carry_out
                     ),
                 )
-                .with(format!("pot {}, rake {}, fees {}, forfeited {}, shouts {} (reserved {})", s.pot, s.rake, s.total_fees, s.forfeited, s.shouts, s.shout_fees))
+                .with(format!("received {}, fees {}, outcome {}", s.received, s.fees, s.outcome))
+                .with("conservation: received + carry_in = paid + fees + carry_out")
                 .with(format!("byte-for-byte equal ({} bytes of JSON)", ours.len()))
             } else {
                 fail(
@@ -648,12 +587,13 @@ pub fn verify_ironwood_bundle(tx: &Transaction) -> Result<usize, String> {
 /// The payouts a bundle reports as unclaimable, with an explanation line
 /// each; an error when an entry does not match the settlement.
 pub(crate) fn unclaimable_payouts(
-    bundle: &ProofBundle,
+    settlement: &Settlement,
+    unclaimable: &[UnclaimablePayout],
 ) -> Result<(BTreeSet<u32>, Vec<String>), &'static str> {
     let mut indices = BTreeSet::new();
     let mut notes = Vec::new();
-    for u in &bundle.unclaimable_payouts {
-        let Some(payout) = bundle.settlement.payouts.get(u.payout_index as usize) else {
+    for u in unclaimable {
+        let Some(payout) = settlement.payouts.get(u.payout_index as usize) else {
             return Err("An unclaimable entry names a payout the settlement does not have.");
         };
         if u.net != payout.net || !indices.insert(u.payout_index) {
@@ -669,12 +609,12 @@ pub(crate) fn unclaimable_payouts(
     Ok((indices, notes))
 }
 
-fn check_payout(input: &RoundInput<'_>) -> CheckResult {
+fn check_payout<R: Rules>(input: &RoundInput<'_, R>) -> CheckResult {
     let id = CheckId::Payout;
     let bundle = input.bundle;
     let settlement = &bundle.settlement;
     // Unclaimable payouts (malformed sealed receivers) have no output.
-    let (unclaimable, notes) = match unclaimable_payouts(bundle) {
+    let (unclaimable, notes) = match unclaimable_payouts(settlement, &bundle.unclaimable_payouts) {
         Ok(v) => v,
         Err(why) => return fail(id, why),
     };
@@ -690,9 +630,7 @@ fn check_payout(input: &RoundInput<'_>) -> CheckResult {
             }
             return result;
         }
-        let why = if bundle.version < 4 {
-            format!("Not available for this bundle version ({}): payout openings were added in version 4.", bundle.version)
-        } else if settlement.payouts.is_empty() {
+        let why = if settlement.payouts.is_empty() {
             "Nothing to pay this round, so there is no payout transaction.".to_owned()
         } else {
             "The payout transaction is not mined yet (or not recorded); check again later."
@@ -724,7 +662,7 @@ fn check_payout(input: &RoundInput<'_>) -> CheckResult {
     let Some(mined) = input.txs.get(&openings.txid) else {
         return fail(id, "The payout transaction could not be fetched.");
     };
-    let tx = match parse_tx(bundle.params.network, &openings.txid, mined) {
+    let tx = match parse_tx(bundle.chain.network, &openings.txid, mined) {
         Ok(tx) => tx,
         Err(e) => return fail(id, "The payout transaction does not parse.").with(e.to_string()),
     };
@@ -824,8 +762,8 @@ fn check_payout(input: &RoundInput<'_>) -> CheckResult {
 
 /// Whether `bundle.round`'s window is consistent with its parameters (used
 /// before fetching data).
-pub fn check_window(bundle: &ProofBundle) -> Result<(), VerifyError> {
-    let window = rounds::round_window(&bundle.params, bundle.round)
+pub fn check_window<P>(bundle: &ProofBundle<P>) -> Result<(), VerifyError> {
+    let window = zecraft_core::draw::round_window(&bundle.chain, bundle.round)
         .map_err(|e| VerifyError::Window(e.to_string()))?;
     if window != bundle.window {
         return Err(VerifyError::Window(format!(
@@ -839,29 +777,32 @@ pub fn check_window(bundle: &ProofBundle) -> Result<(), VerifyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zecraft_core::proof::UnclaimablePayout;
+    use zecraft_core::entry::SealedReceiver;
+    use zecraft_core::rules::{Payout, PayoutKind, RefundReason};
 
-    /// A real settled bundle (round 84) with two payouts added to its
-    /// settlement: a labelled test fixture for the unclaimable rule.
-    fn bundle_with_payouts() -> ProofBundle {
-        let mut bundle: ProofBundle = serde_json::from_str(include_str!(
-            "../../../docs/examples/phase6/round-84.proof.json"
-        ))
-        .expect("fixture");
-        let payout = |net: u64| zecraft_core::settle::Payout {
-            sealed_receiver: zecraft_core::memo::SealedReceiver::from_bytes(&[0x42; 92])
-                .expect("92 bytes"),
-            memo_round: 84,
-            memo_tile: 3,
+    fn settlement_with_payouts() -> Settlement {
+        let payout = |net: u64| Payout {
+            sealed: SealedReceiver::from_bytes(&[0x42; 92]).expect("92 bytes"),
+            aad: vec![1, 2, 3],
             gross: net + 5_000,
             fee: 5_000,
             net,
-            reason: zecraft_core::settle::PayoutReason::Refund(
-                zecraft_core::digs::RefundReason::RoundVoided,
-            ),
+            kind: PayoutKind::Refund {
+                reason: RefundReason::RoundVoided,
+            },
         };
-        bundle.settlement.payouts = vec![payout(100_000), payout(200_000)];
-        bundle
+        Settlement {
+            round: 84,
+            voided: true,
+            outcome: serde_json::Value::Null,
+            received: 310_000,
+            carry_in: 0,
+            payouts: vec![payout(100_000), payout(200_000)],
+            payout_inputs: vec![],
+            paid: 300_000,
+            fees: 10_000,
+            carry_out: 0,
+        }
     }
 
     fn unclaimable(index: u32, net: u64) -> UnclaimablePayout {
@@ -874,17 +815,21 @@ mod tests {
 
     #[test]
     fn unclaimable_entries_must_match_the_settlement() {
-        let mut bundle = bundle_with_payouts();
-        bundle.unclaimable_payouts = vec![unclaimable(1, 200_000)];
-        let (indices, notes) = unclaimable_payouts(&bundle).expect("valid");
+        let s = settlement_with_payouts();
+        let (indices, notes) = unclaimable_payouts(&s, &[unclaimable(1, 200_000)]).expect("valid");
         assert_eq!(indices.into_iter().collect::<Vec<_>>(), vec![1]);
         assert!(notes[0].contains("payout 1 (200000 zatoshis) was not paid"));
-
-        bundle.unclaimable_payouts = vec![unclaimable(1, 199_999)];
-        assert!(unclaimable_payouts(&bundle).is_err(), "amount differs");
-        bundle.unclaimable_payouts = vec![unclaimable(2, 1)];
-        assert!(unclaimable_payouts(&bundle).is_err(), "no such payout");
-        bundle.unclaimable_payouts = vec![unclaimable(0, 100_000), unclaimable(0, 100_000)];
-        assert!(unclaimable_payouts(&bundle).is_err(), "listed twice");
+        assert!(
+            unclaimable_payouts(&s, &[unclaimable(1, 199_999)]).is_err(),
+            "amount differs"
+        );
+        assert!(
+            unclaimable_payouts(&s, &[unclaimable(2, 1)]).is_err(),
+            "no such payout"
+        );
+        assert!(
+            unclaimable_payouts(&s, &[unclaimable(0, 100_000), unclaimable(0, 100_000)]).is_err(),
+            "listed twice"
+        );
     }
 }

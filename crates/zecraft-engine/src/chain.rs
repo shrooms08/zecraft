@@ -18,13 +18,12 @@ use async_trait::async_trait;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, RawTransaction, TxFilter};
 use zcash_protocol::consensus::{BlockHeight, BranchId, MAIN_NETWORK, TEST_NETWORK};
-use zecraft_core::params::Network;
+use zecraft_core::params::{ChainParams, Network};
 use zecraft_vault::lightwalletd::{self, Client};
 use zecraft_vault::pool::{Confirmation, Pool};
 
-use crate::config::GameConfig;
 use crate::db::{BlockRow, NoteRow};
-use crate::decrypt::DigScanner;
+use crate::decrypt::EntryScanner;
 use crate::error::EngineError;
 use crate::store::Store;
 
@@ -234,15 +233,15 @@ pub fn branch_for(network: Network, height: u32) -> BranchId {
 pub async fn ingest(
     source: &mut dyn ChainSource,
     store: &Store,
-    scanner: &DigScanner,
-    config: &GameConfig,
+    scanner: &EntryScanner,
+    params: &ChainParams,
 ) -> Result<IngestReport, EngineError> {
     let chain_tip = source.latest_height().await?;
     store.write(|db| db.set_chain_tip(chain_tip))?;
-    backfill_commitments(source, store, config).await?;
+    backfill_commitments(source, store, params).await?;
     // Before genesis no block is stored; keep the tip's time so the board can
     // estimate when round 0 starts.
-    if chain_tip < config.genesis_height {
+    if chain_tip < params.genesis_height {
         if let Some(block) = source
             .block_range(chain_tip, chain_tip)
             .await?
@@ -261,7 +260,7 @@ pub async fn ingest(
 
     let mut next = match stored_tip {
         Some(tip) => tip + 1,
-        None => config.genesis_height,
+        None => params.genesis_height,
     };
     while next <= chain_tip {
         let end = next.saturating_add(BATCH_SIZE - 1).min(chain_tip);
@@ -280,7 +279,7 @@ pub async fn ingest(
                     got: block.height,
                 });
             }
-            if let Some(fork) = detect_reorg(source, store, config, &block).await? {
+            if let Some(fork) = detect_reorg(source, store, params, &block).await? {
                 tracing::warn!(fork, height, "reorg detected; rolling back");
                 let discarded = store.write(|db| db.rollback_to(fork))?;
                 if !discarded.is_empty() {
@@ -291,7 +290,7 @@ pub async fn ingest(
                 next = fork;
                 break;
             }
-            let notes = block_notes(source, scanner, config, &block).await?;
+            let notes = block_notes(source, scanner, params, &block).await?;
             report.new_notes += store_block(store, &block, &notes)?;
             report.new_blocks += 1;
             next = height + 1;
@@ -306,15 +305,15 @@ pub async fn ingest(
 pub async fn backfill_commitments(
     source: &mut dyn ChainSource,
     store: &Store,
-    config: &GameConfig,
+    params: &ChainParams,
 ) -> Result<usize, EngineError> {
     let missing = store.read(|db| db.notes_without_cmx())?;
     for note in &missing {
         let raw = source.transaction(&note.txid).await?;
-        let cmx = DigScanner::commitment_of(
+        let cmx = EntryScanner::commitment_of(
             &note.txid_hex(),
             &raw,
-            branch_for(config.params.network, note.height),
+            branch_for(params.network, note.height),
             note.pool,
             note.action_index,
         )?;
@@ -334,7 +333,7 @@ pub async fn backfill_commitments(
 async fn detect_reorg(
     source: &mut dyn ChainSource,
     store: &Store,
-    config: &GameConfig,
+    params: &ChainParams,
     block: &CompactBlock,
 ) -> Result<Option<u32>, EngineError> {
     let height = block.height as u32;
@@ -359,7 +358,7 @@ async fn detect_reorg(
         if fetched.hash == stored.hash {
             return Ok(Some(candidate + 1));
         }
-        if candidate <= config.genesis_height {
+        if candidate <= params.genesis_height {
             return Err(EngineError::ReorgTooDeep(candidate));
         }
         candidate -= 1;
@@ -370,8 +369,8 @@ async fn detect_reorg(
 /// and decrypts the full transaction of every hit. No database access.
 async fn block_notes(
     source: &mut dyn ChainSource,
-    scanner: &DigScanner,
-    config: &GameConfig,
+    scanner: &EntryScanner,
+    params: &ChainParams,
     block: &CompactBlock,
 ) -> Result<Vec<NoteRow>, EngineError> {
     let height = block.height as u32;
@@ -379,7 +378,7 @@ async fn block_notes(
     if block.hash.len() != 32 || block.prev_hash.len() != 32 {
         return Err(malformed("hash fields must be 32 bytes".into()));
     }
-    let branch = branch_for(config.params.network, height);
+    let branch = branch_for(params.network, height);
     let mut notes = Vec::new();
     for tx in &block.vtx {
         let hits = scanner.scan_compact_tx(height, tx)?;
@@ -455,16 +454,20 @@ mod tests {
     #[tokio::test]
     async fn follows_the_chain_and_records_vault_notes() {
         let vault = TestVault::new(10);
-        let config = vault.config(1_000);
-        let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+        let config = vault.config(1_000, zecraft_raffle::RaffleParams::default());
+        let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
         let mut chain = SyntheticChain::new(&vault, 990, 1_700_000_000);
         chain.advance(12); // 990..=1001
-        let memo = vault.dig_memo(0, 1, 1);
-        chain.push_block(vec![chain.payment(200_000, Pool::Ironwood, memo.encode())]); // 1002
+        let memo = vault.entry_memo(&zecraft_raffle::FORMAT, 0, zecraft_raffle::Tickets(2), 1);
+        chain.push_block(vec![chain.payment(
+            200_000,
+            Pool::Ironwood,
+            memo.encode(&zecraft_raffle::FORMAT),
+        )]); // 1002
         chain.advance(3);
         let store = Store::open_in_memory().expect("db");
 
-        let report = ingest(&mut chain, &store, &scanner, &config)
+        let report = ingest(&mut chain, &store, &scanner, &config.chain)
             .await
             .expect("ingest");
         assert_eq!(report.new_notes, 1);
@@ -506,7 +509,7 @@ mod tests {
                 .len(),
             1
         );
-        let filled = backfill_commitments(&mut chain, &store, &config)
+        let filled = backfill_commitments(&mut chain, &store, &config.chain)
             .await
             .expect("backfill");
         assert_eq!(filled, 1);
@@ -519,7 +522,7 @@ mod tests {
         );
 
         // A second pass with nothing new is a no-op.
-        let again = ingest(&mut chain, &store, &scanner, &config)
+        let again = ingest(&mut chain, &store, &scanner, &config.chain)
             .await
             .expect("ingest");
         assert_eq!(again.new_blocks, 0);
@@ -529,14 +532,14 @@ mod tests {
     #[tokio::test]
     async fn reorg_rolls_back_and_rescans() {
         let vault = TestVault::new(11);
-        let config = vault.config(100);
-        let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+        let config = vault.config(100, zecraft_raffle::RaffleParams::default());
+        let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
         let mut chain = SyntheticChain::new(&vault, 100, 1_700_000_000);
         chain.advance(5); // 100..=104
         chain.push_block(vec![chain.payment(300_000, Pool::Ironwood, [0xF6; 512])]); // 105
         chain.advance(2); // 106, 107
         let store = Store::open_in_memory().expect("db");
-        ingest(&mut chain, &store, &scanner, &config)
+        ingest(&mut chain, &store, &scanner, &config.chain)
             .await
             .expect("ingest");
         assert_eq!(store.read(|db| db.note_count()).expect("count"), 1);
@@ -548,7 +551,7 @@ mod tests {
         chain.advance(1); // new 105
         chain.push_block(vec![chain.payment(400_000, Pool::Ironwood, [0xF6; 512])]); // new 106
         chain.advance(3); // 107..=109
-        let report = ingest(&mut chain, &store, &scanner, &config)
+        let report = ingest(&mut chain, &store, &scanner, &config.chain)
             .await
             .expect("ingest");
         assert_eq!(report.reorg_from, Some(105));

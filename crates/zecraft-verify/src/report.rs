@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum CheckId {
     Beacon,
-    Digs,
+    Entries,
     Timing,
     Settlement,
     Payout,
@@ -18,7 +18,7 @@ impl CheckId {
     pub fn title(self) -> &'static str {
         match self {
             CheckId::Beacon => "Randomness beacon",
-            CheckId::Digs => "Digs complete and correct",
+            CheckId::Entries => "Entries complete and correct",
             CheckId::Timing => "Timing rule",
             CheckId::Settlement => "Settlement",
             CheckId::Payout => "Payout transaction",
@@ -74,7 +74,6 @@ impl CheckResult {
 pub struct RoundReport {
     pub round: u32,
     pub bundle_version: u32,
-    pub rules_version: Option<u32>,
     pub checks: Vec<CheckResult>,
 }
 

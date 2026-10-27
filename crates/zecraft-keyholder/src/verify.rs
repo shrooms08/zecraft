@@ -14,14 +14,14 @@
 //!    receiver with the sealing key;
 //! 4. there is exactly one other value-carrying output and it goes to the
 //!    vault's internal-scope change address;
-//! 5. the inputs are exactly the dig notes the rules charge for the claimed
-//!    rounds ([`zecraft_core::settle::payout_inputs`]), plus operator-float notes
-//!    (vault notes that are not digs) only when those dig notes cannot pay the
-//!    outputs and the fee; the fee equals the ZIP 317 fee for the
+//! 5. the inputs are exactly the entry notes this node's own settlement of the
+//!    claimed rounds spends (`Settlement::payout_inputs`), plus operator-float
+//!    notes (vault notes the game does not know) only when those entry notes
+//!    cannot pay the outputs and the fee; the fee equals the ZIP 317 fee for the
 //!    transaction's action counts and does not exceed the fees the rules
 //!    collected for those rounds;
 //! 6. none of the claimed rounds was signed by this node before, and each was
-//!    settled under the rules version this node signs for;
+//!    settled by this node (with the game's rules, through `settle_checked`);
 //! 7. the transaction is V6 on the consensus branch of its expiry height,
 //!    and not expired.
 //!
@@ -40,10 +40,9 @@ use pczt::roles::verifier::Verifier;
 use pczt::Pczt;
 use zcash_primitives::transaction::TxVersion;
 use zcash_protocol::consensus::{BranchId, MAIN_NETWORK, TEST_NETWORK};
-use zecraft_core::memo::ORCHARD_RECEIVER_LEN;
+use zecraft_core::entry::{SealingPrivateKey, ORCHARD_RECEIVER_LEN};
 use zecraft_core::params::Network;
-use zecraft_core::seal::SealingPrivateKey;
-use zecraft_core::settle;
+use zecraft_core::rules::{self, Rules};
 use zecraft_engine::coordinator::payable_receiver;
 use zecraft_engine::db::Db;
 use zecraft_engine::processor::Processor;
@@ -52,16 +51,10 @@ use zecraft_vault::send::{self, PendingSpend};
 use crate::db::NodeDb;
 use crate::error::KeyholderError;
 
-/// Oldest rules version this node signs payouts for: rules v2 introduced the
-/// dig fee and the exact input set the checks below rely on. Rules v3 only
-/// adds the text encoding of dig memos, which this node's own classification
-/// already applied when it settled the round.
-pub const MIN_SIGNED_RULES_VERSION: u32 = 2;
-
 /// What verification needs.
-pub struct VerifyContext<'a> {
+pub struct VerifyContext<'a, R: Rules> {
     /// The game, for the rules and for classifying this node's notes.
-    pub processor: &'a Processor,
+    pub processor: &'a Processor<R>,
     pub fvk: &'a FullViewingKey,
     pub sealing: &'a SealingPrivateKey,
     /// This node's own chain database (its notes and settlements).
@@ -117,7 +110,7 @@ struct ExpectedPayout {
     net: u64,
 }
 
-/// A dig note this node expects to be spent.
+/// An entry note this node expects to be spent.
 struct ExpectedInput {
     round: u32,
     txid: String,
@@ -133,12 +126,12 @@ struct SeenSpend {
 }
 
 /// Runs every check; returns the pending spends to sign on success.
-pub fn verify_payout(
-    ctx: &VerifyContext<'_>,
+pub fn verify_payout<R: Rules>(
+    ctx: &VerifyContext<'_, R>,
     pczt_bytes: &[u8],
     rounds: &[u32],
 ) -> Result<Approved, KeyholderError> {
-    let params = &ctx.processor.config().params;
+    let params = &ctx.processor.config().chain;
     let pczt =
         Pczt::parse(pczt_bytes).map_err(|e| refuse(format!("PCZT does not parse: {e:?}")))?;
 
@@ -164,8 +157,8 @@ pub fn verify_payout(
             effects.consensus_branch_id()
         )));
     }
-    // A node whose chain view stalled could miss digs and take an unsettled
-    // dig for operator float (security review L3): sign only when current.
+    // A node whose chain view stalled could miss entries and take an unsettled
+    // entry for operator float (security review L3): sign only when current.
     let stored = ctx
         .chain
         .tip()?
@@ -220,16 +213,10 @@ pub fn verify_payout(
             .chain
             .settlement(*round)?
             .ok_or_else(|| refuse(format!("round {round} is not settled on this node")))?;
-        if row.rules_version < MIN_SIGNED_RULES_VERSION {
-            return Err(refuse(format!(
-                "round {round} was settled under rules version {}; this node only signs payouts of rules version {MIN_SIGNED_RULES_VERSION} or later",
-                row.rules_version
-            )));
-        }
         for (index, payout) in row.settlement.payouts.iter().enumerate() {
             // The coordinator's own rule: a payout with no payable receiver
             // is not paid and its value stays in the change output.
-            match payable_receiver(params.network, ctx.sealing, payout) {
+            match payable_receiver(params.network, &R::FORMAT, ctx.sealing, payout) {
                 Ok(address) => expected_payouts.push(ExpectedPayout {
                     round: *round,
                     index,
@@ -242,9 +229,9 @@ pub fn verify_payout(
             }
         }
         collected_fees = collected_fees
-            .checked_add(row.settlement.total_fees)
+            .checked_add(row.settlement.fees)
             .ok_or_else(|| refuse("collected fees overflow"))?;
-        for note in ctx.processor.payout_inputs(ctx.chain, &row)? {
+        for note in ctx.processor.payout_inputs(&row) {
             let stored = ctx
                 .chain
                 .notes_in_range(note.height, note.height + 1)?
@@ -252,13 +239,13 @@ pub fn verify_payout(
                 .find(|n| n.txid_hex() == note.txid && n.action_index == note.output_index)
                 .ok_or_else(|| {
                     refuse(format!(
-                        "dig note {}:{} of round {round} is not in this node's database",
+                        "entry note {}:{} of round {round} is not in this node's database",
                         note.txid, note.output_index
                     ))
                 })?;
             let cmx = stored.cmx.ok_or_else(|| {
                 refuse(format!(
-                    "dig note {}:{} of round {round} has no recorded note commitment yet (backfill pending)",
+                    "entry note {}:{} of round {round} has no recorded note commitment yet (backfill pending)",
                     note.txid, note.output_index
                 ))
             })?;
@@ -412,14 +399,14 @@ pub fn verify_payout(
         )));
     }
 
-    // 5. Inputs: the charged dig notes, plus float notes only when needed.
+    // 5. Inputs: the charged entry notes, plus float notes only when needed.
     let mut float_inputs: Vec<&SeenSpend> = Vec::new();
     let mut matched_inputs = vec![false; expected_inputs.len()];
     for spend in &spends {
         if let Some(pos) = expected_inputs.iter().position(|e| e.cmx == spend.cmx) {
             if matched_inputs[pos] {
                 return Err(refuse(format!(
-                    "input {}: dig note spent twice",
+                    "input {}: entry note spent twice",
                     spend.index
                 )));
             }
@@ -428,7 +415,7 @@ pub fn verify_payout(
         }
         if ctx.chain.note_by_cmx(&spend.cmx)?.is_some() {
             return Err(refuse(format!(
-                "input {}: note is not a dig of rounds {rounds:?}",
+                "input {}: note is not an entry of rounds {rounds:?}",
                 spend.index
             )));
         }
@@ -437,7 +424,7 @@ pub fn verify_payout(
     if let Some(pos) = matched_inputs.iter().position(|m| !m) {
         let e = &expected_inputs[pos];
         return Err(refuse(format!(
-            "dig note {}:{} of round {} is not spent by the transaction",
+            "entry note {}:{} of round {} is not spent by the transaction",
             e.txid, e.output_index, e.round
         )));
     }
@@ -452,14 +439,14 @@ pub fn verify_payout(
     let charged_count = u64::try_from(expected_inputs.len()).map_err(|_| refuse("count"))?;
     let payout_count = u64::try_from(expected_payouts.len()).map_err(|_| refuse("count"))?;
     if let Some(first_float) = float_inputs.first() {
-        let fee_without_float = settle::zip317_fee(params, charged_count, payout_count + 1)
-            .map_err(|e| refuse(e.to_string()))?;
+        let fee_without_float = rules::zip317_fee(params, charged_count, payout_count + 1)
+            .ok_or_else(|| refuse("fee overflow"))?;
         let needed = payouts_value
             .checked_add(fee_without_float)
             .ok_or_else(|| refuse("needed value overflow"))?;
         if charged_value > needed {
             return Err(refuse(format!(
-                "input {}: float note not needed: the dig notes of rounds {rounds:?} cover the outputs and the fee",
+                "input {}: float note not needed: the entry notes of rounds {rounds:?} cover the outputs and the fee",
                 first_float.index
             )));
         }
@@ -470,12 +457,12 @@ pub fn verify_payout(
         .checked_sub(out_total)
         .ok_or_else(|| refuse("outputs exceed spent value"))?;
     let actions: usize = action_counts.values().sum();
-    let expected_fee = settle::zip317_fee(
+    let expected_fee = rules::zip317_fee(
         params,
         u64::try_from(actions).map_err(|_| refuse("count"))?,
         0,
     )
-    .map_err(|e| refuse(e.to_string()))?;
+    .ok_or_else(|| refuse("fee overflow"))?;
     if fee != expected_fee {
         return Err(refuse(format!(
             "fee {} differs from the ZIP 317 fee {} for {actions} actions",

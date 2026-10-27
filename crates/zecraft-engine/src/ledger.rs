@@ -1,11 +1,11 @@
-//! The vault ledger: `vault balance = Cache + unpaid obligations + reserved
+//! The vault ledger: `vault balance = carry + unpaid obligations + reserved
 //! fees + unclaimable payouts + operator float`.
 //!
 //! Obligations are the net amounts of settlements that have no payout
 //! transaction yet; reserved fees are the per-output fees those settlements
 //! already deducted from players (they pay the payout transaction's fee).
 //! When a transaction's real ZIP 317 fee exceeds the fees collected, the
-//! difference comes out of the operator float, never the Cache, and a payout
+//! difference comes out of the operator float, never the carry, and a payout
 //! whose deficit the float cannot cover is refused.
 
 use serde::{Deserialize, Serialize};
@@ -13,14 +13,15 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Db, PayoutState, PlanStatus};
 use crate::error::EngineError;
 use crate::processor::Processor;
+use zecraft_core::rules::Rules;
 
 /// `GET /v1/vault/ledger`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     /// Total Ironwood value in the vault wallet (spendable or not).
     pub vault_balance: u64,
-    /// Deep Cache balance.
-    pub cache: u64,
+    /// Value the game carries to the next round.
+    pub carry: u64,
     /// Net payouts and refunds owed but not yet broadcast.
     pub unpaid_obligations: u64,
     /// Per-output fees already deducted from those payouts, reserved for
@@ -29,7 +30,7 @@ pub struct Ledger {
     /// Payouts that could not be paid (their digger's sealed receiver does
     /// not open); held in the vault, never counted as operator float.
     pub unclaimable: u64,
-    /// `vault_balance − cache − unpaid_obligations − reserved_fees −
+    /// `vault_balance − carry − unpaid_obligations − reserved_fees −
     /// unclaimable`, floored at 0.
     pub operator_float: u64,
     /// How far the vault is short of covering everything above (0 when sound).
@@ -43,9 +44,9 @@ pub struct Ledger {
 }
 
 /// Computes the ledger from the engine database and the vault's balance.
-pub fn compute(
+pub fn compute<R: Rules>(
     db: &Db,
-    processor: &Processor,
+    processor: &Processor<R>,
     vault_balance: u64,
     last_reconciliation_height: u32,
 ) -> Result<Ledger, EngineError> {
@@ -70,16 +71,16 @@ pub fn compute(
             }
         }
         unpaid_obligations = unpaid_obligations
-            .checked_add(row.settlement.total_paid)
+            .checked_add(row.settlement.paid)
             .ok_or(EngineError::Overflow("obligations"))?;
         reserved_fees = reserved_fees
-            .checked_add(row.settlement.total_fees)
+            .checked_add(row.settlement.fees)
             .ok_or(EngineError::Overflow("reserved fees"))?;
         unpaid_rounds.push(round);
     }
-    let cache = processor.cache_balance(db)?;
+    let carry = processor.carry(db)?;
     let unclaimable = db.unclaimable_total()?;
-    let owed = cache
+    let owed = carry
         .checked_add(unpaid_obligations)
         .and_then(|v| v.checked_add(reserved_fees))
         .and_then(|v| v.checked_add(unclaimable))
@@ -90,7 +91,7 @@ pub fn compute(
     };
     Ok(Ledger {
         vault_balance,
-        cache,
+        carry,
         unpaid_obligations,
         reserved_fees,
         unclaimable,

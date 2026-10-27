@@ -1,7 +1,7 @@
 [package]
 name = "zecraft-keyholder"
 version = "0.1.0"
-description = "Zeek keyholder node: FROST DKG participant that independently verifies every payout before signing"
+description = "Zecraft keyholder node: FROST DKG participant that independently recomputes every settlement with the game's Rules and verifies every payout before signing"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,10 +9,6 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
-
-[[bin]]
-name = "zecraft-keyholder"
-path = "src/main.rs"
 
 [dependencies]
 zecraft-core = { path = "../zecraft-core" }
@@ -51,6 +47,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+zecraft-raffle = { path = "../../games/raffle/rules" }
 zecraft-engine = { path = "../zecraft-engine", features = ["testkit"] }
 incrementalmerkletree = "0.8.2"
 shardtree = "0.7"

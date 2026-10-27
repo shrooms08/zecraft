@@ -1,45 +1,47 @@
-//! End-to-end: a recorded (synthetic) chain with digs flows through
-//! ingestion, timing rule, beacon verification and settlement without any
-//! network, and the result is reproducible, verifiable and private.
+//! End-to-end, against the raffle: a recorded (synthetic) chain with ticket
+//! purchases flows through ingestion, the timing rule, beacon verification
+//! and settlement without any network, and the result is reproducible,
+//! verifiable and private.
 
-use zecraft_core::digs::RefundReason;
-use zecraft_core::rounds::RoundStatus;
-use zecraft_core::settle::{PayoutReason, RoundOutcome};
+use zecraft_core::draw::RoundStatus;
+use zecraft_core::rules::{PayoutKind, RefundReason};
 use zecraft_engine::api::{config_response, proof_response, round_response};
 use zecraft_engine::chain::ingest;
 use zecraft_engine::config::SETTLE_CONFIRMATIONS;
-use zecraft_engine::db::Pool;
-use zecraft_engine::decrypt::DigScanner;
+use zecraft_engine::db::{EntryKind, Pool};
+use zecraft_engine::decrypt::EntryScanner;
 use zecraft_engine::processor::{Event, Processor};
 use zecraft_engine::proof;
 use zecraft_engine::store::Store;
 use zecraft_engine::synthetic::{SyntheticChain, TestVault};
+use zecraft_raffle::{Raffle, RaffleOutcome, Tickets, FORMAT};
 
 mod common;
-use common::{fixture_beacons, scenario, start_time, Scenario, FIXTURE_ROUND, GENESIS};
+use common::{
+    binary, config, fixture_beacons, scenario, start_time, Scenario, FIXTURE_ROUND, GENESIS,
+};
+
+const RECEIVED: u64 = 300_000 + 200_000 + 100_000 + 100_000 + 150_000 + 8_000 + 150_000;
 
 #[tokio::test]
 async fn round_is_ingested_settled_served_and_reproducible() {
     let Scenario { vault, mut chain } = scenario(0);
-    let config = vault.config(GENESIS);
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let config = config(&vault);
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let store = Store::open_in_memory().expect("db");
-    let mut processor = Processor::new(config.clone());
+    let mut processor = Processor::new(Raffle, config.clone());
     let mut beacons = fixture_beacons();
 
-    let report = ingest(&mut chain, &store, &scanner, &config)
+    let report = ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
     assert_eq!(
-        report.new_notes, 6,
+        report.new_notes, 7,
         "payments to the external address, never change"
     );
 
     // Before the beacon is published nothing settles.
-    let (_, _, _) = processor
-        .status(&store.reader().expect("reader"), 0)
-        .expect("status");
-    let beacon_time = start_time(&config.params) + 600 + 900;
+    let beacon_time = start_time(&config.chain) + 600 + 900;
     let events = processor
         .process(&store, &mut beacons, beacon_time - 1)
         .await
@@ -66,78 +68,115 @@ async fn round_is_ingested_settled_served_and_reproducible() {
             ..
         }
     ));
-    assert!(matches!(events[1], Event::Settled { round: 0, .. }));
+    assert!(matches!(
+        events[1],
+        Event::Settled {
+            round: 0,
+            voided: false,
+            ..
+        }
+    ));
     let row = store
         .read(|db| db.settlement(0))
         .expect("row")
         .expect("settled");
-    let RoundOutcome::Drawn {
-        treasure_tile,
-        cache_triggered,
-    } = row.outcome
-    else {
-        panic!("expected a drawn round");
-    };
+    assert!(!row.voided);
     let s = &row.settlement;
-    assert_eq!(row.rules_version, 2);
-    assert_eq!(
-        s.pot,
-        1_200_000 - 3 * 5_000,
-        "three dig fees come off first"
-    );
-    assert_eq!(s.rake, 59_250);
-    assert_eq!(s.forfeited, 200_000, "dust dig and text memo");
-    assert_eq!(
-        s.dig_fees,
-        4 * 5_000,
-        "three valid digs and the paid refund"
-    );
-    let refunds: Vec<_> = s
+    let outcome: RaffleOutcome = serde_json::from_value(s.outcome.clone()).expect("outcome");
+    assert_eq!(outcome.tickets_sold, 6);
+    let ticket = outcome.winning_ticket.expect("drawn");
+    assert!(ticket < 6);
+    let winner = outcome.winner.as_ref().expect("winner");
+    // Draw order is (height, txid, action): player 1 owns 0..3, player 2
+    // 3..5, player 3 ticket 5.
+    let (first, tickets) = match ticket {
+        0..=2 => (0, 3),
+        3 | 4 => (3, 2),
+        _ => (5, 1),
+    };
+    assert_eq!((winner.first_ticket, winner.tickets), (first, tickets));
+    assert!(outcome.winner_paid);
+
+    assert_eq!(s.received, RECEIVED);
+    assert_eq!(s.carry_in, 0);
+    let wins: Vec<_> = s
         .payouts
         .iter()
-        .filter(|p| {
-            matches!(
-                p.reason,
-                PayoutReason::Refund(RefundReason::WrongRound { memo_round: 7 })
-            )
-        })
+        .filter(|p| p.kind == PayoutKind::Win)
         .collect();
-    assert_eq!(refunds.len(), 1);
-    assert_eq!(refunds[0].net, 200_000 - 5_000 - 5_000);
-    // The payout transaction must spend exactly the four charged notes.
-    let inputs = processor
-        .payout_inputs(&store.reader().expect("reader"), &row)
-        .expect("inputs");
-    assert_eq!(inputs.len(), 4);
-    assert!(inputs.iter().all(|n| n.value >= 200_000));
-    assert!(inputs
-        .windows(2)
-        .all(|w| (w[0].height, &w[0].txid, w[0].output_index)
-            <= (w[1].height, &w[1].txid, w[1].output_index)));
-    let winners = s
-        .payouts
+    assert_eq!(wins.len(), 1);
+    assert_eq!(
+        wins[0].gross,
+        600_000 - 3 * 5_000,
+        "the pot minus three entry fees"
+    );
+    assert_eq!(wins[0].net, 600_000 - 3 * 5_000 - 5_000);
+    let refund = |reason: RefundReason| {
+        s.payouts
+            .iter()
+            .find(|p| {
+                p.kind
+                    == PayoutKind::Refund {
+                        reason: reason.clone(),
+                    }
+            })
+            .map(|p| p.net)
+    };
+    assert_eq!(
+        refund(RefundReason::WrongRound { memo_round: 7 }),
+        Some(90_000)
+    );
+    assert_eq!(
+        refund(RefundReason::WrongValue { expected: 200_000 }),
+        Some(140_000)
+    );
+    assert_eq!(s.payouts.len(), 3);
+    assert_eq!(
+        s.payout_inputs.len(),
+        5,
+        "three entries and two refunds are spent"
+    );
+    assert_eq!(s.fees, 5 * 5_000 + 3 * 5_000);
+    assert_eq!(s.carry_out, 8_000 + 150_000, "the kept notes carry over");
+    assert_eq!(s.received + s.carry_in, s.paid + s.fees + s.carry_out);
+    let inputs = processor.payout_inputs(&row);
+    assert!(inputs.windows(2).all(|w| w[0] < w[1]), "canonical order");
+
+    // Entries are stored generically: payload bytes and sealed receivers.
+    let entries = store.read(|db| db.entries(0)).expect("entries");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Valid)
+            .count(),
+        3
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Refund)
+            .count(),
+        2
+    );
+    assert!(entries
         .iter()
-        .filter(|p| matches!(p.reason, PayoutReason::Win { .. }))
-        .count();
-    match treasure_tile {
-        3 => assert_eq!(winners, 2),
-        17 => assert_eq!(winners, 1),
-        _ => assert_eq!(winners, 0),
-    }
-    if !cache_triggered {
-        assert_eq!(s.cache_paid, 0);
-    }
+        .all(|e| e.payload.len() == 2 && e.sealed_receiver.len() == 92));
+    assert!(entries
+        .iter()
+        .any(|e| e.payload == Tickets(3).0.to_be_bytes()));
 
     // API views.
-    let config_view = config_response(&config, true, false);
-    assert_eq!(config_view.genesis_height, GENESIS);
+    let config_view = config_response::<Raffle>(&config, true);
+    assert_eq!(config_view.chain.genesis_height, GENESIS);
+    assert_eq!(config_view.memo.magic, "ZRFL");
+    assert_eq!(config_view.memo.text_prefix, "zrfl1:");
     assert_eq!(
         config_view.vault_address.as_deref(),
         Some(config.vault_address.as_str())
     );
-    // Readiness mode (digging off) withholds everything a payment needs.
-    let closed = config_response(&config, false, false);
-    assert!(!closed.digging_enabled);
+    // With entries off, everything a payment needs is withheld.
+    let closed = config_response::<Raffle>(&config, false);
+    assert!(!closed.entries_open);
     assert!(
         closed.vault_address.is_none()
             && closed.sealing_public_key.is_none()
@@ -151,28 +190,23 @@ async fn round_is_ingested_settled_served_and_reproducible() {
     let round_view =
         round_response(&processor, &store.reader().expect("reader"), 0).expect("round view");
     assert_eq!(round_view.status, RoundStatus::Settled);
+    assert_eq!((round_view.entries, round_view.refunds), (3, 2));
+    assert_eq!(round_view.game["tickets_sold"], 6);
     let settled = round_view.settled.as_ref().expect("settled view");
-    assert_eq!(settled.rules_version, 2);
-    assert_eq!(settled.dig_fees, 20_000);
-    assert_eq!(settled.tile_totals[3], 800_000);
-    assert_eq!(settled.tile_totals[17], 400_000);
-    assert_eq!(settled.treasure_tile, Some(treasure_tile));
     assert_eq!(settled.payouts, s.payouts);
+    assert_eq!(settled.outcome, s.outcome);
     let board = processor
         .board(&store.reader().expect("reader"))
         .expect("board");
     assert_eq!(board.round, 1, "the tip is in round 1 now");
-    assert_eq!(board.cache, s.new_cache);
-    let pending = processor
-        .pending_rounds(&store.reader().expect("reader"))
-        .expect("pending");
-    assert!(pending.is_empty());
+    assert_eq!(board.carry, s.carry_out);
+    assert_eq!(board.game["game"], "raffle");
 
-    // Proof bundle recomputes to the identical settlement with zecraft-core only.
+    // The proof bundle recomputes to the identical settlement.
     let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
         .expect("proof")
         .expect("settled");
-    let recomputed = proof::recompute(&bundle).expect("recompute");
+    let recomputed = proof::recompute(&Raffle, &bundle).expect("recompute");
     assert_eq!(
         serde_json::to_string(&recomputed).expect("json"),
         serde_json::to_string(&bundle.settlement).expect("json")
@@ -182,6 +216,11 @@ async fn round_is_ingested_settled_served_and_reproducible() {
             .expect("proof")
             .is_none()
     );
+    // A tampered bundle does not recompute to its settlement.
+    let mut forged = bundle.clone();
+    forged.carry_in += 1;
+    forged.settlement.carry_in += 1;
+    assert!(proof::recompute(&Raffle, &forged).map_or(true, |s| s != forged.settlement));
 
     // Privacy: no API output contains an opened payout receiver (the players'
     // receivers are [player; 43]); the sealed bytes are there instead.
@@ -195,42 +234,44 @@ async fn round_is_ingested_settled_served_and_reproducible() {
     ] {
         all_json.push_str(&text);
     }
-    for player in 1u8..=4 {
-        let opened = hex::encode([player; 43]);
+    for player in 1u8..=6 {
         assert!(
-            !all_json.contains(&opened),
+            !all_json.contains(&hex::encode([player; 43])),
             "opened receiver of player {player} leaked"
         );
     }
-    let first_sealed = hex::encode(s.payouts[0].sealed_receiver.as_bytes());
-    assert!(all_json.contains(&first_sealed));
+    assert!(all_json.contains(&hex::encode(s.payouts[0].sealed.as_bytes())));
     // The engine never needed the sealing private key; a holder of it can open.
     let opened = vault
-        .dig_memo(0, 3, 1)
-        .open(zecraft_core::params::Network::Test, &vault.sealing_private)
+        .entry_memo(&FORMAT, 0, Tickets(3), 1)
+        .open(
+            &FORMAT,
+            zecraft_core::params::Network::Test,
+            &vault.sealing_private,
+        )
         .expect("open");
     assert_eq!(opened.orchard, [1u8; 43]);
 
     // Idempotent restart: a fresh processor over the same database adds nothing,
     // and a fresh database over the same chain reproduces the state byte for byte.
     let dump = store.read(|db| db.dump()).expect("dump");
-    let mut restarted = Processor::new(config.clone());
+    let mut restarted = Processor::new(Raffle, config.clone());
     let events = restarted
         .process(&store, &mut beacons, beacon_time + 1_000)
         .await
         .expect("process");
     assert!(events.is_empty());
-    let again = ingest(&mut chain, &store, &scanner, &config)
+    let again = ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
     assert_eq!(again.new_blocks, 0);
     assert_eq!(store.read(|db| db.dump()).expect("dump"), dump);
 
     let fresh = Store::open_in_memory().expect("db");
-    ingest(&mut chain, &fresh, &scanner, &config)
+    ingest(&mut chain, &fresh, &scanner, &config.chain)
         .await
         .expect("ingest");
-    let mut fresh_processor = Processor::new(config.clone());
+    let mut fresh_processor = Processor::new(Raffle, config.clone());
     fresh_processor
         .process(&fresh, &mut fixture_beacons(), beacon_time + 5)
         .await
@@ -239,27 +280,27 @@ async fn round_is_ingested_settled_served_and_reproducible() {
 }
 
 #[tokio::test]
-async fn cache_carry_over_is_the_first_previous_cache() {
+async fn initial_carry_is_round_zero_carry_in_and_goes_to_the_winner() {
     let Scenario { vault, mut chain } = scenario(0);
-    let mut config = vault.config(GENESIS);
-    config.initial_cache_zat = 777_000;
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let mut config = config(&vault);
+    config.initial_carry_zat = 777_000;
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let store = Store::open_in_memory().expect("db");
-    let mut processor = Processor::new(config.clone());
+    let mut processor = Processor::new(Raffle, config.clone());
     assert_eq!(
         processor
-            .cache_balance(&store.reader().expect("reader"))
-            .expect("cache"),
+            .carry(&store.reader().expect("reader"))
+            .expect("carry"),
         777_000
     );
     assert_eq!(
-        config_response(&config, true, false).initial_cache_zat,
+        config_response::<Raffle>(&config, true).initial_carry_zat,
         777_000
     );
-    ingest(&mut chain, &store, &scanner, &config)
+    ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
-    let beacon_time = start_time(&config.params) + 600 + 900;
+    let beacon_time = start_time(&config.chain) + 600 + 900;
     processor
         .process(&store, &mut fixture_beacons(), beacon_time + 5)
         .await
@@ -268,16 +309,20 @@ async fn cache_carry_over_is_the_first_previous_cache() {
         .read(|db| db.settlement(0))
         .expect("row")
         .expect("settled");
-    assert_eq!(row.settlement.previous_cache, 777_000);
-    assert!(
-        row.settlement.new_cache >= 777_000 + 59_250,
-        "rake lands on top of the carry-over"
-    );
+    assert_eq!(row.settlement.carry_in, 777_000);
+    let win = row
+        .settlement
+        .payouts
+        .iter()
+        .find(|p| p.kind == PayoutKind::Win)
+        .expect("win");
+    assert_eq!(win.gross, 585_000 + 777_000, "the carry goes to the winner");
+    assert_eq!(row.settlement.carry_out, 158_000);
     let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
         .expect("proof")
         .expect("settled");
     assert_eq!(
-        proof::recompute(&bundle).expect("recompute"),
+        proof::recompute(&Raffle, &bundle).expect("recompute"),
         bundle.settlement
     );
 }
@@ -287,12 +332,11 @@ async fn late_window_is_voided_and_refunded() {
     // The window closes 20 minutes late: the post-close median lands after
     // the beacon, so the timing rule voids the round.
     let Scenario { vault, mut chain } = scenario(1_200);
-    let config = vault.config(GENESIS);
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let config = config(&vault);
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let store = Store::open_in_memory().expect("db");
-    let mut processor = Processor::new(config.clone());
-    let mut beacons = fixture_beacons();
-    ingest(&mut chain, &store, &scanner, &config)
+    let mut processor = Processor::new(Raffle, config.clone());
+    ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
     let (_, status, _) = processor
@@ -301,14 +345,14 @@ async fn late_window_is_voided_and_refunded() {
     assert_eq!(status, RoundStatus::Voided);
 
     let events = processor
-        .process(&store, &mut beacons, 0)
+        .process(&store, &mut fixture_beacons(), 0)
         .await
         .expect("process");
     assert!(matches!(
         events[0],
         Event::Settled {
             round: 0,
-            outcome: RoundOutcome::Voided,
+            voided: true,
             ..
         }
     ));
@@ -316,27 +360,27 @@ async fn late_window_is_voided_and_refunded() {
         .read(|db| db.settlement(0))
         .expect("row")
         .expect("settled");
-    assert_eq!(row.settlement.rake, 0);
-    assert!(row
-        .settlement
+    let s = &row.settlement;
+    assert!(row.voided && s.voided);
+    assert!(s
         .payouts
         .iter()
-        .all(|p| matches!(p.reason, PayoutReason::Refund(_))));
+        .all(|p| matches!(p.kind, PayoutKind::Refund { .. })));
     assert_eq!(
-        row.settlement.payouts.len(),
-        4,
-        "three valid digs and the wrong-round dig"
+        s.payouts.len(),
+        5,
+        "every decodable entry that can pay its fees"
     );
-    assert_eq!(
-        row.settlement.new_cache, 200_000,
-        "forfeits still feed the cache"
-    );
+    assert_eq!(s.paid, 290_000 + 190_000 + 90_000 + 90_000 + 140_000);
+    assert_eq!(s.carry_out, 158_000, "kept notes still carry over");
     let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
         .expect("proof")
         .expect("settled");
     assert!(bundle.beacon.is_none());
-    let recomputed = proof::recompute(&bundle).expect("recompute");
-    assert_eq!(recomputed, bundle.settlement);
+    assert_eq!(
+        proof::recompute(&Raffle, &bundle).expect("recompute"),
+        bundle.settlement
+    );
 }
 
 /// The HTTP layer serves the same views, and 404s unsettled proofs.
@@ -352,14 +396,14 @@ async fn http_api_serves_the_round() {
     use zecraft_engine::proof::ProofBundle;
 
     let Scenario { vault, mut chain } = scenario(0);
-    let config = vault.config(GENESIS);
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    let config = config(&vault);
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let store = Store::open_in_memory().expect("db");
-    let mut processor = Processor::new(config.clone());
-    ingest(&mut chain, &store, &scanner, &config)
+    let mut processor = Processor::new(Raffle, config.clone());
+    ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
-    let beacon_time = start_time(&config.params) + 600 + 900;
+    let beacon_time = start_time(&config.chain) + 600 + 900;
     processor
         .process(&store, &mut fixture_beacons(), beacon_time + 5)
         .await
@@ -372,8 +416,7 @@ async fn http_api_serves_the_round() {
         started: std::time::Instant::now(),
         ledger: None,
         chain_servers: None,
-        digging: true,
-        demo_digs: false,
+        entries_open: true,
         stream_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
             zecraft_engine::api::MAX_STREAMS,
         )),
@@ -416,14 +459,12 @@ async fn http_api_serves_the_round() {
     let view: zecraft_engine::api::StatusResponse = serde_json::from_slice(&body).expect("json");
     assert_eq!(view.engine.last_settled_round, Some(0));
     assert_eq!(view.engine.stored_tip, health.tip_height);
-    assert!(view.engine.last_block_time.is_some());
     assert_eq!(
         view.keyholders.len(),
         3,
         "configured keyholders listed even before a probe"
     );
-    assert!(view.keyholders.iter().all(|k| k.reachable.is_none()));
-    assert!(view.digging_enabled);
+    assert!(view.entries_open);
 
     let (status, body) = get(&app, "/v1/rounds/0").await;
     assert_eq!(status, StatusCode::OK);
@@ -433,15 +474,15 @@ async fn http_api_serves_the_round() {
 
     let (status, body) = get(&app, "/v1/rounds/0/proof").await;
     assert_eq!(status, StatusCode::OK);
-    let bundle: ProofBundle = serde_json::from_slice(&body).expect("json");
+    let bundle: ProofBundle<zecraft_raffle::RaffleParams> =
+        serde_json::from_slice(&body).expect("json");
     assert_eq!(
-        proof::recompute(&bundle).expect("recompute"),
+        proof::recompute(&Raffle, &bundle).expect("recompute"),
         bundle.settlement
     );
-    for player in 1u8..=4 {
+    for player in 1u8..=6 {
         assert!(!String::from_utf8_lossy(&body).contains(&hex::encode([player; 43])));
     }
-
     let (status, _) = get(&app, "/v1/rounds/1/proof").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -450,143 +491,89 @@ async fn http_api_serves_the_round() {
     let pending: PendingResponse = serde_json::from_slice(&body).expect("json");
     assert!(pending.rounds.is_empty());
 
-    let (status, _) = get(&app, "/v1/board").await;
+    let (status, body) = get(&app, "/v1/board").await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = get(&app, "/v1/config").await;
+    let board: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(
+        board["game"]["game"], "raffle",
+        "the game's board is served as-is"
+    );
+    assert!(board["blocks_remaining"].is_u64() && board["round"].is_u64());
+    let (status, body) = get(&app, "/v1/config").await;
     assert_eq!(status, StatusCode::OK);
+    let cfg: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(cfg["game"]["ticket_price_zat"], 100_000);
 
-    // Phase 7a: past rounds, memo digests, keyholder status.
     let (status, body) = get(&app, "/v1/rounds").await;
     assert_eq!(status, StatusCode::OK);
     let rounds: zecraft_engine::api::RoundsResponse = serde_json::from_slice(&body).expect("json");
-    assert_eq!(rounds.rounds.len(), 1, "round 0 had digs");
-    assert_eq!(rounds.rounds[0].round, 0);
-    assert!(["paying", "no_winner", "paid"].contains(&rounds.rounds[0].status.as_str()));
-    for player in 1u8..=4 {
-        assert!(!String::from_utf8_lossy(&body).contains(&hex::encode([player; 43])));
-    }
+    assert_eq!(rounds.rounds.len(), 1, "round 0 had entries");
+    assert_eq!(rounds.rounds[0].status, "paying");
+    assert_eq!((rounds.rounds[0].wins, rounds.rounds[0].refunds), (1, 2));
     let (status, body) = get(&app, "/v1/rounds/0/digests").await;
     assert_eq!(status, StatusCode::OK);
-    let digests: zecraft_engine::api::DigestsResponse = serde_json::from_slice(&body).expect("json");
-    assert!(!digests.notes.is_empty());
+    let digests: zecraft_engine::api::DigestsResponse =
+        serde_json::from_slice(&body).expect("json");
     assert!(digests.notes.iter().all(|n| n.memo_sha256.len() == 64));
     let (status, body) = get(&app, "/v1/keyholders/status").await;
     assert_eq!(status, StatusCode::OK);
-    let keys: zecraft_engine::api::KeyholdersResponse = serde_json::from_slice(&body).expect("json");
+    let keys: zecraft_engine::api::KeyholdersResponse =
+        serde_json::from_slice(&body).expect("json");
     assert_eq!(keys.threshold, 2);
-    assert_eq!(keys.keyholders.len(), 3);
     assert_eq!(keys.keyholders[0].label, "Keyholder A");
-    assert_eq!(
-        keys.keyholders[0].reachable, None,
-        "never probed in this test"
-    );
 }
 
-/// Rules v3: from the activation height a dig may carry the `zeek1:` text
-/// memo. The same chain settles differently before and after activation, the
-/// board reports the prize pool next to the gross total, and the version 3
-/// proof bundle recomputes.
+/// A round with no valid tickets carries everything over, and the next
+/// round's winner receives it.
 #[tokio::test]
-async fn text_memo_digs_count_from_the_activation_height() {
-    let vault = TestVault::new(77);
-    let base = vault.config(GENESIS);
-    let mut chain = SyntheticChain::new(&vault, GENESIS, start_time(&base.params));
-    chain.push_block(vec![]); // GENESIS
-    let text_memo = |tile: u8, player: u8| {
-        let text = vault.dig_memo(0, tile, player).encode_text();
-        let mut field = [0u8; 512];
-        field[..text.len()].copy_from_slice(text.as_bytes());
-        field
-    };
-    // GENESIS + 1: a text dig before activation; GENESIS + 2: one after it,
-    // next to a binary dig.
-    chain.push_block(vec![chain.payment(
-        300_000,
-        Pool::Ironwood,
-        text_memo(4, 1),
-    )]);
-    chain.push_block(vec![
-        chain.payment(200_000, Pool::Ironwood, text_memo(5, 2)),
-        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 6, 3).encode()),
-    ]);
-    while chain.next_height() < GENESIS + base.params.blocks_per_round {
+async fn an_empty_round_carries_to_the_next_winner() {
+    let vault = TestVault::new(79);
+    let config = config(&vault);
+    let params = config.chain.clone();
+    let mut chain = SyntheticChain::new(&vault, GENESIS, start_time(&params));
+    chain.push_block(vec![chain.payment(150_000, Pool::Ironwood, [0xF6; 512])]); // kept
+    while chain.next_height() < GENESIS + params.blocks_per_round {
         chain.advance(1);
     }
-    chain.advance(base.params.mtp_window + SETTLE_CONFIRMATIONS);
-    let beacon_time = start_time(&base.params) + 600 + 900;
-
-    let mut v3 = base.clone();
-    v3.params.text_memo_activation_height = Some(GENESIS + 2);
-    v3.validate().expect("valid config");
-    for (config, expected_version, valid_digs, forfeited) in
-        [(base, 2u32, 1usize, 500_000u64), (v3, 3, 2, 300_000)]
-    {
-        let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
-        let store = Store::open_in_memory().expect("db");
-        let mut processor = Processor::new(config.clone());
-        ingest(&mut chain, &store, &scanner, &config)
-            .await
-            .expect("ingest");
-        processor
-            .process(&store, &mut fixture_beacons(), beacon_time + 5)
-            .await
-            .expect("process");
-        let row = store
-            .read(|db| db.settlement(0))
-            .expect("row")
-            .expect("settled");
-        assert_eq!(row.rules_version, expected_version);
-        assert_eq!(row.settlement.forfeited, forfeited);
-        let gross: u64 = if valid_digs == 2 { 300_000 } else { 100_000 };
-        assert_eq!(row.settlement.pot, gross - valid_digs as u64 * 5_000);
-        let view = round_response(&processor, &store.reader().expect("reader"), 0).expect("view");
-        assert_eq!(view.digs, valid_digs);
-        let bundle = proof_response(&processor, &store.reader().expect("reader"), 0)
-            .expect("proof")
-            .expect("settled");
-        assert_eq!(bundle.version, proof::PROOF_VERSION);
-        assert_eq!(bundle.rules_version, Some(expected_version));
-        assert_eq!(bundle.claimed_rules_version(), Some(expected_version));
-        assert_eq!(
-            bundle.params.text_memo_activation_height.is_some(),
-            expected_version == 3
-        );
-        assert_eq!(
-            proof::recompute(&bundle).expect("recompute"),
-            bundle.settlement
-        );
+    let round1 = GENESIS + params.blocks_per_round;
+    chain.push_block(vec![chain.payment(
+        200_000,
+        Pool::Ironwood,
+        binary(&vault, 1, 2, 1),
+    )]);
+    while chain.next_height() < round1 + params.blocks_per_round {
+        chain.advance(1);
     }
-}
-
-/// The board labels the prize pool (net of dig fees and rake) and the gross
-/// total separately while a round is open.
-#[tokio::test]
-async fn board_reports_prize_pool_and_gross_total() {
-    let vault = TestVault::new(78);
-    let config = vault.config(GENESIS);
-    let mut chain = SyntheticChain::new(&vault, GENESIS, start_time(&config.params));
-    chain.push_block(vec![
-        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 1, 1).encode()),
-        chain.payment(100_000, Pool::Ironwood, vault.dig_memo(0, 2, 2).encode()),
-    ]);
-    chain.advance(2);
-    let scanner = DigScanner::new(config.incoming_viewing_key().expect("ivk"));
+    chain.advance(params.mtp_window + SETTLE_CONFIRMATIONS);
+    let scanner = EntryScanner::new(config.incoming_viewing_key().expect("ivk"));
     let store = Store::open_in_memory().expect("db");
-    let processor = Processor::new(config.clone());
-    ingest(&mut chain, &store, &scanner, &config)
+    let mut processor = Processor::new(Raffle, config.clone());
+    ingest(&mut chain, &store, &scanner, &config.chain)
         .await
         .expect("ingest");
-    let board = processor
-        .board(&store.reader().expect("reader"))
-        .expect("board");
-    assert_eq!(board.round, 0);
-    assert_eq!(board.digs, 2);
-    assert_eq!(board.gross_dug_zat, 200_000);
-    assert_eq!(board.prize_pool_zat, 180_500, "(200,000 - 2 x 5,000) x 95%");
-    assert_eq!(board.rules_version, 2);
-    let json = serde_json::to_string(&board).expect("json");
-    assert!(json.contains("\"prize_pool_zat\":180500"));
-    assert!(json.contains("\"gross_dug_zat\":200000"));
+    // Round 0 settles with the fixture beacon; round 1's beacon is not
+    // recorded, so it waits.
+    let beacon_time = start_time(&params) + 600 + 900;
+    processor
+        .process(&store, &mut fixture_beacons(), beacon_time + 5)
+        .await
+        .expect("process");
+    let r0 = store
+        .read(|db| db.settlement(0))
+        .expect("row")
+        .expect("settled");
+    assert!(r0.settlement.payouts.is_empty());
+    assert_eq!(
+        r0.settlement.carry_out, 150_000,
+        "no tickets: everything carries"
+    );
+    assert_eq!(
+        processor
+            .carry(&store.reader().expect("reader"))
+            .expect("carry"),
+        150_000
+    );
+    assert!(store.read(|db| db.settlement(1)).expect("row").is_none());
 }
 
 /// The relay serves tip, length-prefixed compact blocks, transactions and

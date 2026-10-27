@@ -1,4 +1,4 @@
-//! Prove-a-win: "the treasure payout of round N, output k, was received at
+//! Prove-a-win: "the winning payout of round N, output k, was received at
 //! an address I control", without revealing anything else about the
 //! prover's wallet.
 //!
@@ -60,7 +60,7 @@
 //! output's `cmx` in the mined payout transaction, and the settlement saying
 //! payout `k` is the treasure share of round N, this proves: *whoever made
 //! this proof can spend notes sent to the address that received round N's
-//! treasure payout k*.
+//! winning payout k*.
 //!
 //! It does **not** prove that the prover still holds the payout, that the
 //! proof was made by the original winner rather than someone the winner
@@ -88,7 +88,7 @@ use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zecraft_core::params::Network;
 use zecraft_core::proof::{PayoutOpening, ProofBundle};
-use zecraft_core::settle::PayoutReason;
+use zecraft_core::rules::PayoutKind;
 
 use crate::chain::{parse_tx, txid_bytes, MinedTx};
 use crate::checks::{opening_cmx, verifying_key};
@@ -107,7 +107,7 @@ pub const MAX_ENCODED_LEN: usize = 16 * 1024;
 pub enum WinProofError {
     #[error("the payout address does not belong to this wallet's keys")]
     NotOurAddress,
-    #[error("payout {0} of the round is not a treasure payout")]
+    #[error("payout {0} of the round is not a winning payout")]
     NotATreasurePayout(u32),
     #[error("the round's proof bundle has no payout openings yet (payout not mined?)")]
     NoOpenings,
@@ -222,9 +222,9 @@ fn opening_address(opening: &PayoutOpening) -> Result<([u8; 43], Address), WinPr
     Ok((raw, address))
 }
 
-/// The opening of treasure payout `payout_index` from a round's bundle.
-pub fn treasure_opening(
-    bundle: &ProofBundle,
+/// The opening of winning payout `payout_index` from a round's bundle.
+pub fn win_opening<P>(
+    bundle: &ProofBundle<P>,
     payout_index: u32,
 ) -> Result<PayoutOpening, WinProofError> {
     let payout =
@@ -237,7 +237,7 @@ pub fn treasure_opening(
                 index: payout_index,
                 count: bundle.settlement.payouts.len(),
             })?;
-    if !matches!(payout.reason, PayoutReason::Win { .. }) {
+    if !matches!(payout.kind, PayoutKind::Win) {
         return Err(WinProofError::NotATreasurePayout(payout_index));
     }
     let openings = bundle
@@ -252,17 +252,17 @@ pub fn treasure_opening(
         .ok_or(WinProofError::NoOpening(payout_index))
 }
 
-/// Builds a win proof for treasure payout `payout_index` of `bundle`'s round,
+/// Builds a win proof for winning payout `payout_index` of `bundle`'s round,
 /// with the keys of the wallet that received it.
-pub fn create<R: RngCore + CryptoRng>(
-    bundle: &ProofBundle,
+pub fn create<P, R: RngCore + CryptoRng>(
+    bundle: &ProofBundle<P>,
     payout_index: u32,
     fvk: &FullViewingKey,
     ask: &SpendAuthorizingKey,
     proving_key: &ProvingKey,
     rng: &mut R,
 ) -> Result<WinProof, WinProofError> {
-    let opening = treasure_opening(bundle, payout_index)?;
+    let opening = win_opening(bundle, payout_index)?;
     let payout_txid = bundle
         .payout_openings
         .as_ref()
@@ -296,7 +296,7 @@ pub fn create<R: RngCore + CryptoRng>(
     let mut nonce = [0u8; 32];
     rng.fill_bytes(&mut nonce);
     let msg = message(
-        bundle.params.network,
+        bundle.chain.network,
         bundle.round,
         &txid,
         payout_index,
@@ -316,7 +316,7 @@ pub fn create<R: RngCore + CryptoRng>(
     let enc = action.encrypted_note();
     Ok(WinProof {
         version: WIN_PROOF_VERSION,
-        network: bundle.params.network,
+        network: bundle.chain.network,
         round: bundle.round,
         payout_txid,
         payout_index,
@@ -491,24 +491,24 @@ fn rebuild_bundle(proof: &WinProof) -> Result<Bundle<Authorized, i64>, String> {
 /// Verifies a win proof against the round's proof bundle and the mined
 /// payout transaction (`payout_tx`, whose inclusion the caller confirmed in
 /// the block at `payout_tx.height`, `included`).
-pub fn verify(
+pub fn verify<P>(
     proof: &WinProof,
-    bundle: &ProofBundle,
+    bundle: &ProofBundle<P>,
     payout_tx: &MinedTx,
     included: bool,
 ) -> WinVerdict {
     let mut steps = Steps(Vec::new());
     // 1. The claim matches the round.
-    if proof.network != bundle.params.network || proof.round != bundle.round {
+    if proof.network != bundle.chain.network || proof.round != bundle.round {
         return steps.fail(
             "round",
             format!(
                 "the proof is for round {} on {:?}, the bundle is round {} on {:?}",
-                proof.round, proof.network, bundle.round, bundle.params.network
+                proof.round, proof.network, bundle.round, bundle.chain.network
             ),
         );
     }
-    let opening = match treasure_opening(bundle, proof.payout_index) {
+    let opening = match win_opening(bundle, proof.payout_index) {
         Ok(o) => o,
         Err(e) => return steps.fail("payout", e.to_string()),
     };
@@ -536,7 +536,7 @@ pub fn verify(
     steps.pass(
         "payout",
         format!(
-            "payout {} of round {} is a treasure payout of {} zatoshis",
+            "payout {} of round {} is a winning payout of {} zatoshis",
             proof.payout_index, proof.round, payout.net
         ),
     );
@@ -547,7 +547,7 @@ pub fn verify(
             "the payout transaction is not in the block it claims",
         );
     }
-    let tx = match parse_tx(bundle.params.network, &proof.payout_txid, payout_tx) {
+    let tx = match parse_tx(bundle.chain.network, &proof.payout_txid, payout_tx) {
         Ok(tx) => tx,
         Err(e) => return steps.fail("payout transaction", e.to_string()),
     };
@@ -644,7 +644,7 @@ pub fn verify(
     WinVerdict {
         valid: true,
         claim: format!(
-            "The holder of this proof controls the address that received round {}'s treasure payout {} ({} zatoshis, transaction {}).",
+            "The holder of this proof controls the address that received round {}'s winning payout {} ({} zatoshis, transaction {}).",
             proof.round, proof.payout_index, opening.value, proof.payout_txid
         ),
         reason: None,

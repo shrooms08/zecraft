@@ -24,9 +24,11 @@ use zcash_note_encryption::{ShieldedOutput, ENC_CIPHERTEXT_SIZE};
 use zcash_primitives::transaction::{TransactionData, TxVersion};
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::ZatBalance;
-use zecraft_core::memo::{DigMemo, PayoutReceiver, ORCHARD_RECEIVER_LEN};
-use zecraft_core::params::{GameParams, Network};
-use zecraft_core::seal::{generate_sealing_keypair, SealingPrivateKey, SealingPublicKey};
+use zecraft_core::entry::{
+    generate_sealing_keypair, EntryMemo, MemoFormat, Payload, PayoutReceiver, SealingPrivateKey,
+    SealingPublicKey, ORCHARD_RECEIVER_LEN,
+};
+use zecraft_core::params::{ChainParams, Network};
 
 use crate::chain::ChainSource;
 use crate::config::GameConfig;
@@ -70,14 +72,16 @@ impl TestVault {
         self.fvk.address_at(0u32, Scope::External)
     }
 
-    /// Testnet game config with round 0 starting at `genesis_height`.
-    pub fn config(&self, genesis_height: u32) -> GameConfig {
+    /// Testnet game config with round 0 starting at `genesis_height` and
+    /// the game parameters `game`.
+    pub fn config<P>(&self, genesis_height: u32, game: P) -> GameConfig<P> {
         let receiver = PayoutReceiver {
             network: Network::Test,
             orchard: self.address().to_raw_address_bytes(),
         };
         GameConfig {
-            params: GameParams::testnet(genesis_height),
+            chain: ChainParams::testnet(genesis_height),
+            game,
             vault_address: receiver
                 .to_unified_address()
                 .expect("an Orchard receiver always encodes"),
@@ -86,23 +90,43 @@ impl TestVault {
                 .ufvk
                 .to_unified_incoming_viewing_key()
                 .encode(&zcash_protocol::consensus::TEST_NETWORK),
-            genesis_height,
-            initial_cache_zat: 0,
+            initial_carry_zat: 0,
         }
     }
 
-    /// A dig memo for `round`/`tile` whose payout receiver is derived from
-    /// `player` (a stand-in for the player's own address).
-    pub fn dig_memo(&self, round: u32, tile: u8, player: u8) -> DigMemo {
-        let receiver = PayoutReceiver {
+    /// The payout receiver standing in for `player`'s own address.
+    pub fn player_receiver(player: u8) -> PayoutReceiver {
+        PayoutReceiver {
             network: Network::Test,
             orchard: [player; ORCHARD_RECEIVER_LEN],
-        };
-        let mut rng = StdRng::seed_from_u64(
-            u64::from(round) << 16 | u64::from(tile) << 8 | u64::from(player),
-        );
-        DigMemo::seal(round, tile, &receiver, &self.sealing_public, &mut rng)
-            .expect("tile is in range")
+        }
+    }
+
+    /// An entry memo of `format` for `round`/`payload` whose payout
+    /// receiver is [`TestVault::player_receiver`]`(player)`.
+    pub fn entry_memo<P: Payload>(
+        &self,
+        format: &MemoFormat,
+        round: u32,
+        payload: P,
+        player: u8,
+    ) -> EntryMemo<P> {
+        let seed = payload
+            .to_bytes()
+            .iter()
+            .fold(u64::from(round) << 16 | u64::from(player), |a, b| {
+                a.rotate_left(8) ^ u64::from(*b)
+            });
+        let mut rng = StdRng::seed_from_u64(seed);
+        EntryMemo::seal(
+            format,
+            round,
+            payload,
+            &Self::player_receiver(player),
+            &self.sealing_public,
+            &mut rng,
+        )
+        .expect("payload is valid")
     }
 }
 

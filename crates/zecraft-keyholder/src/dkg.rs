@@ -48,7 +48,7 @@ use reddsa::frost::redpallas::keys::EvenY;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zecraft_core::seal::{generate_sealing_keypair, SealingPublicKey};
+use zecraft_core::entry::seal::{generate_sealing_keypair, SealingPublicKey};
 use zecraft_vault::frost::{self, Identifier, KeyPackage, PublicKeyPackage};
 use zecraft_vault::keys;
 use zecraft_vault::store::{KeyholderFile, SealingKeyFile, SecretsDir, VaultFile};
@@ -400,7 +400,7 @@ pub struct KeyMaterial {
     pub public_key_package: PublicKeyPackage,
     pub vault: VaultFile,
     pub fvk: FullViewingKey,
-    pub sealing: zecraft_core::seal::SealingPrivateKey,
+    pub sealing: zecraft_core::entry::seal::SealingPrivateKey,
 }
 
 impl KeyMaterial {

@@ -1,28 +1,31 @@
-//! `zecraft-keyholder` binary.
+//! The keyholder's command line, for any game: a game's keyholder binary is
+//! one call, `crate::cli::main(MyGame, "my-game-keyholder")`.
+//! `identity-keygen`, `identity`, `address` and `dkg` need no game; `serve`
+//! follows the chain and verifies payouts with the game's rules.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::api::{dkg_router, router, AppState, DkgNode};
+use crate::config::KeyholderConfig;
+use crate::db::NodeDb;
+use crate::dkg::{self, DkgState, KeyMaterial};
+use crate::follower::Follower;
+use crate::identity::Identity;
+use crate::signing::SignerState;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::{Mutex, RwLock};
+use zecraft_core::rules::Rules;
 use zecraft_engine::config::{GameConfig, DEFAULT_RELAYS};
 use zecraft_engine::processor::Processor;
 use zecraft_engine::store::Store;
-use zecraft_keyholder::api::{dkg_router, router, AppState, DkgNode};
-use zecraft_keyholder::config::KeyholderConfig;
-use zecraft_keyholder::db::NodeDb;
-use zecraft_keyholder::dkg::{self, DkgState, KeyMaterial};
-use zecraft_keyholder::follower::Follower;
-use zecraft_keyholder::identity::Identity;
-use zecraft_keyholder::signing::SignerState;
 
 #[derive(Parser)]
 #[command(
-    name = "zecraft-keyholder",
     version,
-    about = "Zeek keyholder node (FROST DKG participant and payout verifier)"
+    about = "Zecraft keyholder node (FROST DKG participant and payout verifier)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -86,11 +89,13 @@ struct ServeArgs {
     dkg: Option<String>,
 }
 
-fn main() -> anyhow::Result<()> {
+/// Runs the keyholder command line for `rules`.
+pub fn main<R: Rules + Clone>(rules: R, name: &'static str) -> anyhow::Result<()> {
+    use clap::{CommandFactory, FromArgMatches};
     let _ = dotenvy::dotenv();
     // Each keyholder service has its own ZECRAFT_LOG_DIR.
     let _log_guard = zecraft_engine::logging::init("keyholder")?;
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches_mut(&mut Cli::command().name(name).get_matches())?;
     let load = |path: &PathBuf| {
         KeyholderConfig::load(path).with_context(|| format!("loading {}", path.display()))
     };
@@ -131,7 +136,7 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()
                 .context("starting async runtime")?
-                .block_on(serve(config, args))
+                .block_on(serve(rules, config, args))
         }
     }
 }
@@ -193,13 +198,13 @@ async fn ceremony_only(
 /// Loads this node's key material and checks its sealing key is the game's:
 /// with another key no receiver would open, every payout would look
 /// unclaimable, and the node would approve leaving winners unpaid (review N7).
-fn load_keys(
+fn load_keys<P>(
     config: &KeyholderConfig,
-    game: &GameConfig,
-) -> Result<KeyMaterial, zecraft_keyholder::KeyholderError> {
+    game: &GameConfig<P>,
+) -> Result<KeyMaterial, crate::KeyholderError> {
     let keys = KeyMaterial::load(config)?;
     if keys.sealing.public_key().to_bytes() != game.sealing_public_key.to_bytes() {
-        return Err(zecraft_keyholder::KeyholderError::Config(
+        return Err(crate::KeyholderError::Config(
             "this node's payout sealing key does not match the game config's sealing_public_key"
                 .into(),
         ));
@@ -210,15 +215,19 @@ fn load_keys(
 /// Longest a chain follower pass may run.
 const FOLLOWER_PASS_TIMEOUT: Duration = Duration::from_secs(300);
 
-async fn serve(config: KeyholderConfig, args: ServeArgs) -> anyhow::Result<()> {
+async fn serve<R: Rules + Clone>(
+    rules: R,
+    config: KeyholderConfig,
+    args: ServeArgs,
+) -> anyhow::Result<()> {
     let identity = Identity::load(&config.identity_path())
         .context("loading the identity key (run `identity-keygen` first)")?;
-    let game = GameConfig::load(&config.game_config)?;
+    let game = GameConfig::load(&config.game_config, &rules)?;
     let chain = Arc::new(Store::open(&config.engine_db_path())?);
     let node_db = NodeDb::open(&config.node_db_path())?;
     let keys = match load_keys(&config, &game) {
         Ok(k) => Some(Arc::new(k)),
-        Err(zecraft_keyholder::KeyholderError::NoKeyShare) => None,
+        Err(crate::KeyholderError::NoKeyShare) => None,
         Err(e) => return Err(e.into()),
     };
     tracing::info!(
@@ -231,11 +240,17 @@ async fn serve(config: KeyholderConfig, args: ServeArgs) -> anyhow::Result<()> {
     // Keyholder n starts at server n-1, so with several healthy servers the
     // three nodes read the chain from different upstreams.
     let prefer = usize::from(config.identifier.saturating_sub(1));
-    let mut follower = Follower::new(game.clone(), config.lightwalletd.clone(), prefer, relays)?;
+    let mut follower = Follower::new(
+        rules.clone(),
+        game.clone(),
+        config.lightwalletd.clone(),
+        prefer,
+        relays,
+    )?;
     let state = Arc::new(AppState {
         config: config.clone(),
         game: game.clone(),
-        processor: Processor::new(game.clone()),
+        processor: Processor::new(rules, game.clone()),
         identity,
         dkg: Arc::new(DkgNode {
             config: config.clone(),
@@ -270,7 +285,7 @@ async fn serve(config: KeyholderConfig, args: ServeArgs) -> anyhow::Result<()> {
                 .build()?;
             let output = dkg::run_ceremony(
                 &config,
-                game.params.network,
+                game.chain.network,
                 &state.identity,
                 &state.dkg.state,
                 session,
@@ -308,7 +323,7 @@ async fn serve(config: KeyholderConfig, args: ServeArgs) -> anyhow::Result<()> {
                     tracing::info!("key material loaded");
                     *state.keys.write().await = Some(Arc::new(k));
                 }
-                Err(zecraft_keyholder::KeyholderError::NoKeyShare) => {}
+                Err(crate::KeyholderError::NoKeyShare) => {}
                 Err(e) => tracing::error!(error = %e, "key material refused"),
             }
         }

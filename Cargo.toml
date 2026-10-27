@@ -2,8 +2,8 @@
 resolver = "2"
 # Phase B, temporarily: engine, keyholder, verify and player rejoin once they
 # are generic over `Rules` (B3, B4); until then they still speak Zeek's rules.
-members = ["crates/zecraft-core", "crates/zecraft-vault"]
-exclude = ["crates/zecraft-engine", "crates/zecraft-player", "crates/zecraft-keyholder", "crates/zecraft-verify"]
+members = ["crates/zecraft-core", "crates/zecraft-vault", "crates/zecraft-engine", "crates/zecraft-keyholder", "crates/zecraft-verify", "games/raffle/rules"]
+exclude = ["crates/zecraft-player"]
 
 [workspace.package]
 edition = "2021"

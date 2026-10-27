@@ -35,18 +35,16 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
-use zecraft_core::memo::DigMemo;
-use zecraft_core::params::GameParams;
+use zecraft_core::entry::{open_receiver, MemoFormat, SealingPrivateKey};
+use zecraft_core::params::ChainParams;
 use zecraft_core::proof::UnclaimablePayout;
-use zecraft_core::seal::SealingPrivateKey;
-use zecraft_core::settle::{self, PayoutReason};
+use zecraft_core::rules::{self, Payout, PayoutKind, Rules, Settlement};
 use zecraft_vault::frost::{self, PublicKeyPackage, SigningCommitments, SigningPackage};
 use zecraft_vault::pool::Pool;
 use zecraft_vault::send::{self, NoteId, PendingSpend, PreparedPczt, ShapedOutput};
 use zecraft_vault::store::{SecretsDir, VaultFile};
 use zecraft_vault::wallet;
 
-use crate::config::GameConfig;
 use crate::db::{Db, PayoutRecord, PayoutState, PlanStatus};
 use crate::error::EngineError;
 use crate::identity::{self, Identity};
@@ -131,7 +129,10 @@ impl CoordinatorSettings {
             .map_err(|_| EngineError::Config(format!("{THRESHOLD_VAR} must be a number")))?;
         Ok(Some(CoordinatorSettings {
             keyholders: parsed,
-            identity_path: PathBuf::from(var(IDENTITY_VAR, ".zecraft/secrets/coordinator/identity.json")),
+            identity_path: PathBuf::from(var(
+                IDENTITY_VAR,
+                ".zecraft/secrets/coordinator/identity.json",
+            )),
             vault_secrets_dir: PathBuf::from(var(VAULT_SECRETS_VAR, ".zecraft/secrets")),
             vault_data_dir: PathBuf::from(var(VAULT_DATA_VAR, ".zecraft/data")),
             threshold,
@@ -166,17 +167,11 @@ pub struct Coordinator {
 /// memo) and its value stays in the vault instead of blocking the round.
 pub fn payable_receiver(
     network: zecraft_core::params::Network,
+    format: &MemoFormat,
     sealing: &SealingPrivateKey,
-    payout: &settle::Payout,
+    payout: &Payout,
 ) -> Result<orchard::Address, String> {
-    let memo = DigMemo {
-        round: payout.memo_round,
-        tile: payout.memo_tile,
-        sealed_receiver: payout.sealed_receiver.clone(),
-        message: None,
-    };
-    let receiver = memo
-        .open(network, sealing)
+    let receiver = open_receiver(format, network, sealing, &payout.sealed, &payout.aad)
         .map_err(|e| format!("the sealed receiver does not open ({e})"))?;
     Option::from(orchard::Address::from_raw_address_bytes(&receiver.orchard))
         .ok_or_else(|| "the opened receiver is not a valid Orchard address".to_owned())
@@ -205,7 +200,11 @@ impl LedgerView {
 
     /// The ledger from the vault wallet (without syncing), reused for
     /// [`LEDGER_CACHE`].
-    pub fn ledger(&self, store: &Store, processor: &Processor) -> Result<Ledger, EngineError> {
+    pub fn ledger<R: Rules>(
+        &self,
+        store: &Store,
+        processor: &Processor<R>,
+    ) -> Result<Ledger, EngineError> {
         let mut cached = self
             .cached
             .lock()
@@ -282,12 +281,13 @@ impl Coordinator {
     /// whose payout transaction is mined: each output is recovered with the
     /// vault's outgoing viewing keys and matched to its settlement payout by
     /// the opened receiver and the net amount. Returns the rounds recorded.
-    pub async fn record_openings(
+    pub async fn record_openings<R: Rules>(
         &self,
         store: &Store,
         source: &mut dyn crate::chain::ChainSource,
-        game: &GameConfig,
+        processor: &Processor<R>,
     ) -> Result<Vec<u32>, EngineError> {
+        let chain = &processor.config().chain;
         let mut recorded = Vec::new();
         for (round, txid) in store.read(|db| db.rounds_missing_openings())? {
             let Some(row) = store.read(|db| db.settlement(round))? else {
@@ -305,7 +305,7 @@ impl Coordinator {
             let raw = source.transaction(&internal).await?;
             // One round that cannot be opened (for example a payout made by an
             // older vault) must not block the others.
-            match self.openings_of(game, &row.settlement, &txid, height, &raw) {
+            match self.openings_of(chain, &R::FORMAT, &row.settlement, &txid, height, &raw) {
                 Ok(openings) => {
                     store.write(|db| db.set_payout_openings(round, &openings))?;
                     tracing::info!(round, %txid, height, outputs = openings.outputs.len(), "payout openings recorded");
@@ -321,15 +321,16 @@ impl Coordinator {
 
     fn openings_of(
         &self,
-        game: &GameConfig,
-        settlement: &settle::Settlement,
+        chain: &ChainParams,
+        format: &MemoFormat,
+        settlement: &Settlement,
         txid: &str,
         height: u32,
         raw: &[u8],
     ) -> Result<zecraft_core::proof::PayoutOpenings, EngineError> {
         use orchard::note_encryption::IronwoodDomain;
         use zcash_note_encryption::try_output_recovery_with_ovk;
-        let branch = crate::chain::branch_for(game.params.network, height);
+        let branch = crate::chain::branch_for(chain.network, height);
         let tx = zcash_primitives::transaction::Transaction::read(raw, branch)
             .map_err(|e| EngineError::Corrupt(format!("payout transaction {txid}: {e}")))?;
         let bundle = tx.ironwood_bundle().ok_or_else(|| {
@@ -369,7 +370,7 @@ impl Coordinator {
         let mut used = vec![false; recovered.len()];
         for (payout_index, payout) in settlement.payouts.iter().enumerate() {
             // Unclaimable payouts have no output (see `payable_receiver`).
-            let Ok(address) = payable_receiver(game.params.network, &self.sealing, payout) else {
+            let Ok(address) = payable_receiver(chain.network, format, &self.sealing, payout) else {
                 continue;
             };
             let receiver = address.to_raw_address_bytes();
@@ -483,7 +484,7 @@ impl Coordinator {
     /// Pays the earliest settlement that is still owed, if any.
     ///
     /// The transaction spends exactly the round's charged dig notes (see
-    /// [`zecraft_core::settle::payout_inputs`]) plus the fewest operator-float
+    /// [`zecraft_core::rules::Settlement::payout_inputs`]) plus the fewest operator-float
     /// notes needed when those do not cover the payouts and the fee (a Cache
     /// payout), pays every payout output and returns one change output to the
     /// vault's internal address. See [`plan_inputs`] for the shape and the fee
@@ -492,18 +493,17 @@ impl Coordinator {
     /// Wallet sync, proving, keyholder signing and broadcast all run with no
     /// engine database connection held; the payout record is written in
     /// short steps around them (only this loop writes payouts).
-    pub async fn pay_next(
+    pub async fn pay_next<R: Rules>(
         &mut self,
         store: &Store,
-        processor: &Processor,
-        game: &GameConfig,
+        processor: &Processor<R>,
     ) -> Result<Option<PayoutReport>, EngineError> {
         let rounds = store.read(payable_rounds)?;
         let now = std::time::Instant::now();
         let Some(round) = self.retry.next(&rounds, now) else {
             return Ok(None);
         };
-        match self.pay_round(round, store, processor, game).await {
+        match self.pay_round(round, store, processor).await {
             Ok(report) => {
                 self.retry.succeeded(round);
                 Ok(report)
@@ -520,13 +520,13 @@ impl Coordinator {
         }
     }
 
-    async fn pay_round(
+    async fn pay_round<R: Rules>(
         &mut self,
         round: u32,
         store: &Store,
-        processor: &Processor,
-        game: &GameConfig,
+        processor: &Processor<R>,
     ) -> Result<Option<PayoutReport>, EngineError> {
+        let chain = &processor.config().chain;
         let row = store
             .read(|db| db.settlement(round))?
             .ok_or_else(|| EngineError::Corrupt(format!("settlement {round} vanished")))?;
@@ -546,7 +546,8 @@ impl Coordinator {
         let mut unclaimable = Vec::new();
         for (index, payout) in row.settlement.payouts.iter().enumerate() {
             // Opened only here, in memory; never stored or logged.
-            let recipient = match payable_receiver(game.params.network, &self.sealing, payout) {
+            let recipient = match payable_receiver(chain.network, &R::FORMAT, &self.sealing, payout)
+            {
                 Ok(address) => address,
                 Err(reason) => {
                     tracing::warn!(round, payout = index, %reason, net = payout.net, "payout has no payable receiver; its value stays in the vault");
@@ -559,9 +560,9 @@ impl Coordinator {
                     continue;
                 }
             };
-            let text = match payout.reason {
-                PayoutReason::Win { .. } => format!("Zeek round {round}: treasure"),
-                PayoutReason::Refund(_) => format!("Zeek round {round}: refund"),
+            let text = match payout.kind {
+                PayoutKind::Win => format!("Zecraft round {round}: win"),
+                PayoutKind::Refund { .. } => format!("Zecraft round {round}: refund"),
             };
             outputs.push(ShapedOutput {
                 recipient,
@@ -606,7 +607,7 @@ impl Coordinator {
                     report.ironwood.total.into_u64(),
                     report.chain_tip,
                 )?,
-                processor.payout_inputs(db, &row)?,
+                processor.payout_inputs(&row),
             ))
         })?;
 
@@ -666,9 +667,9 @@ impl Coordinator {
             })
             .collect();
         let nets: Vec<u64> = outputs.iter().map(|o| o.value.into_u64()).collect();
-        let plan = plan_inputs(&game.params, &charged, &nets, &float_candidates)
+        let plan = plan_inputs(chain, &charged, &nets, &float_candidates)
             .map_err(|e| e.for_rounds(vec![round]))?;
-        let collected = row.settlement.total_fees;
+        let collected = row.settlement.fees;
         let deficit = plan.fee.saturating_sub(collected);
         if deficit > ledger_before.operator_float {
             return Err(EngineError::OperatorFloatExhausted {
@@ -1179,18 +1180,18 @@ impl PlanError {
 /// With `n` charged notes, `k` float notes and `p` payouts the fee is
 /// `marginal · max(2, n + k, p + 1)` and the rules collected
 /// `marginal · (n + p)` (a dig fee per charged note, an output fee per
-/// payout; see [`zecraft_core::settle`]). For `k = 0` the fee is always covered.
+/// payout; see [`zecraft_core::rules`]). For `k = 0` the fee is always covered.
 /// A float note is only needed when the payouts exceed the charged notes'
 /// value, i.e. for a Cache payout; each float note raises the fee by one
 /// marginal fee once `n + k` exceeds `p + 1`, so the fee stays covered
-/// exactly while `k ≤ p` ([`zecraft_core::settle::fees_cover`]). Since float
+/// exactly while `k ≤ p` ([`zecraft_core::rules::fees_cover`]). Since float
 /// notes are taken largest first, `k` is the smallest count that funds the
 /// outputs. Any fee beyond the collected fees (only possible for `k > p`) is
 /// a deficit the caller charges to the operator float, never to the Cache or
 /// to the players' obligations; `pay_next` refuses the transaction when the
 /// float cannot cover it.
 pub fn plan_inputs(
-    params: &GameParams,
+    params: &ChainParams,
     charged: &[PlannedNote],
     payout_nets: &[u64],
     float_candidates: &[PlannedNote],
@@ -1222,8 +1223,7 @@ pub fn plan_inputs(
     loop {
         let spends =
             u64::try_from(charged.len() + chosen.len()).map_err(|_| PlanError::Overflow)?;
-        let fee =
-            settle::zip317_fee(params, spends, payouts + 1).map_err(|_| PlanError::Overflow)?;
+        let fee = rules::zip317_fee(params, spends, payouts + 1).ok_or(PlanError::Overflow)?;
         let needed = outputs.checked_add(fee).ok_or(PlanError::Overflow)?;
         if inputs > needed {
             let change = inputs - needed;
@@ -1331,8 +1331,8 @@ mod tests {
         }
     }
 
-    fn params() -> GameParams {
-        GameParams::testnet(1)
+    fn params() -> ChainParams {
+        ChainParams::testnet(1)
     }
 
     #[test]
@@ -1363,7 +1363,7 @@ mod tests {
         assert_eq!(plan.spends[1].txid, "dd".repeat(32));
         assert_eq!(plan.fee, 10_000, "2 spends, 2 outputs");
         assert_eq!(plan.change, 1_100_000 - 1_000_000 - 10_000);
-        assert!(settle::fees_cover(&params(), 1, 1, 1).expect("cover"));
+        assert!(rules::fees_cover(&params(), 10_000, 2, 1).expect("cover"));
     }
 
     #[test]
@@ -1454,7 +1454,7 @@ mod tests {
             prop_assert_eq!(&result, &again, "deterministic");
             let Ok(plan) = result else {
                 // Only a genuine shortfall or an exact balance without floats fails.
-                let fee0 = settle::zip317_fee(&p, charged.len() as u64, nets.len() as u64 + 1).expect("fee");
+                let fee0 = rules::zip317_fee(&p, charged.len() as u64, nets.len() as u64 + 1).expect("fee");
                 let needed0 = nets.iter().sum::<u64>() + fee0;
                 prop_assert!(total <= needed0);
                 return Ok(());
@@ -1462,7 +1462,7 @@ mod tests {
             let n = charged.len() as u64;
             let k = plan.float_count as u64;
             let outputs = nets.len() as u64 + 1;
-            prop_assert_eq!(plan.fee, settle::zip317_fee(&p, n + k, outputs).expect("fee"));
+            prop_assert_eq!(plan.fee, rules::zip317_fee(&p, n + k, outputs).expect("fee"));
             // Balance.
             let spent: u64 = plan.spends.iter().map(|id| {
                 charged.iter().chain(floats.iter()).find(|c| c.id == *id).expect("known").value
@@ -1474,16 +1474,16 @@ mod tests {
                 prop_assert_eq!(&plan.spends[i], &c.id);
             }
             // Float notes only when the charged notes are short or exact.
-            let fee_without = settle::zip317_fee(&p, n, outputs).expect("fee");
+            let fee_without = rules::zip317_fee(&p, n, outputs).expect("fee");
             if k > 0 {
                 prop_assert!(total <= nets.iter().sum::<u64>() + fee_without);
             }
             // Fee coverage: no float notes, or at most one per payout.
-            let collected = n * p.dig_fee_zat + nets.len() as u64 * p.marginal_fee_zat;
+            let collected = n * p.marginal_fee_zat + nets.len() as u64 * p.marginal_fee_zat;
             if k <= nets.len() as u64 {
                 prop_assert!(plan.fee <= collected, "fee {} > collected {}", plan.fee, collected);
             }
-            prop_assert_eq!(settle::fees_cover(&p, n, k, nets.len() as u64).expect("cover"), k <= nets.len() as u64);
+            prop_assert_eq!(rules::fees_cover(&p, collected, n + k, nets.len() as u64).expect("cover"), k <= nets.len() as u64);
         }
     }
 }
