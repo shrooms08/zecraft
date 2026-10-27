@@ -1,9 +1,9 @@
-//! `zecraft-player`: test players for Zeek on testnet.
+//! `zecraft-player`: test players for the Zecraft raffle on testnet.
 
 /// `zecraft-player` plays on testnet.
 const NETWORK: zecraft_vault::Params = zecraft_vault::Params::TestNetwork;
 
-mod dig;
+mod buy;
 mod notes;
 mod shield;
 mod wallet;
@@ -14,11 +14,15 @@ use zecraft_vault::config::Config;
 use zecraft_vault::store::SecretsDir;
 use zecraft_vault::wallet as vault_wallet;
 
-use crate::dig::RoundChoice;
+use crate::buy::{BuyRequest, PayoutAddress, RoundChoice};
 use crate::wallet::{balance_lines, Player};
 
 #[derive(Parser)]
-#[command(name = "zecraft-player", version, about = "Zeek test player (Zcash testnet)")]
+#[command(
+    name = "zecraft-player",
+    version,
+    about = "Zecraft raffle test player (Zcash testnet)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -56,8 +60,9 @@ enum Command {
         #[arg(long)]
         txid: Option<String>,
     },
-    /// Dig: pay the vault with a sealed dig memo.
-    Dig(DigArgs),
+    /// Buy raffle tickets: build the sealed `ZRFL` memo and pay it, or with
+    /// --uri-only print the ZIP 321 request for any wallet to pay.
+    Buy(BuyArgs),
     /// Send shielded funds to any address with an Orchard-protocol receiver.
     Send {
         name: String,
@@ -70,7 +75,7 @@ enum Command {
         #[arg(long)]
         memo: Option<String>,
     },
-    /// Build a win proof (prove-a-win) for the treasure payout this player
+    /// Build a win proof (prove-a-win) for the winning payout this player
     /// received in a round, print it, and optionally submit it to the engine.
     ProveWin {
         name: String,
@@ -88,24 +93,31 @@ enum Command {
 }
 
 #[derive(Args)]
-struct DigArgs {
+struct BuyArgs {
     name: String,
-    /// Tile to dig, 0..=24.
-    #[arg(long, conflicts_with = "tiles")]
-    tile: Option<u8>,
-    /// Several tiles in one transaction (comma-separated), e.g. 0,1,2. The
-    /// outputs share a txid, so they are linkable to each other by anyone
-    /// with the public UIVK.
-    #[arg(long, value_delimiter = ',', conflicts_with = "tile")]
-    tiles: Vec<u8>,
-    /// Amount in ZEC per tile, e.g. 0.005.
+    /// How many tickets (each costs the game's `ticket_price_zat`).
     #[arg(long)]
-    amount: String,
-    /// Round to name in the memo: `auto` (the board's current round) or a number.
-    #[arg(long, default_value = "auto")]
+    tickets: u16,
+    /// Round to name in the memo: a number, or `auto` (the board's current round).
+    #[arg(long)]
     round: String,
+    /// Where winnings or a refund go: `fresh` (a new diversified address of
+    /// this player's wallet) or any unified address with an Orchard receiver.
+    #[arg(long, default_value = "fresh")]
+    payout_address: PayoutAddress,
+    /// Print the ZIP 321 request instead of paying it (`pay-uri` pays it later).
+    #[arg(long)]
+    uri_only: bool,
+    /// Carry the memo as ZIP 302 text (`zrfl1:...`), for wallets that only
+    /// send text memos.
+    #[arg(long)]
+    text_memo: bool,
     /// Engine base URL.
-    #[arg(long, env = "ZECRAFT_ENGINE_URL", default_value = "http://127.0.0.1:7787")]
+    #[arg(
+        long,
+        env = "ZECRAFT_ENGINE_URL",
+        default_value = "http://127.0.0.1:7787"
+    )]
     engine: String,
 }
 
@@ -237,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             let mut client = config.connect(zecraft_core::params::Network::Test).await?;
             let mut db = player.open_db()?;
             player.ensure_account(&mut db, &mut client).await?;
-            let outcome = dig::pay_request(&player, &mut db, &mut client, request).await?;
+            let outcome = buy::pay_request(&player, &mut db, &mut client, request).await?;
             println!(
                 "Sent {} zatoshis (fee {})",
                 outcome.total_zat, outcome.fee_zat
@@ -271,7 +283,7 @@ fn main() -> anyhow::Result<()> {
             let fvk = orchard::keys::FullViewingKey::from(sk);
             let ask = orchard::keys::SpendAuthorizingKey::from(sk);
             let url = format!("{}/v1/rounds/{round}/proof", engine.trim_end_matches('/'));
-            let bundle: zecraft_core::proof::ProofBundle =
+            let bundle: zecraft_core::proof::ProofBundle<serde_json::Value> =
                 reqwest::get(&url).await?.error_for_status()?.json().await?;
             let openings = bundle.payout_openings.as_ref().context(
                 "the round's bundle has no payout openings yet (not mined, or an old engine)",
@@ -292,8 +304,14 @@ fn main() -> anyhow::Result<()> {
             let pk = orchard::circuit::ProvingKey::build(
                 orchard::circuit::OrchardCircuitVersion::PostNu6_3,
             );
-            let proof =
-                zecraft_verify::win::create(&bundle, index, &fvk, &ask, &pk, &mut rand_core::OsRng)?;
+            let proof = zecraft_verify::win::create(
+                &bundle,
+                index,
+                &fvk,
+                &ask,
+                &pk,
+                &mut rand_core::OsRng,
+            )?;
             let encoded = proof.encode()?;
             let text = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&encoded);
             println!(
@@ -319,7 +337,7 @@ fn main() -> anyhow::Result<()> {
             let mut client = config.connect(zecraft_core::params::Network::Test).await?;
             let mut db = player.open_db()?;
             player.ensure_account(&mut db, &mut client).await?;
-            let outcome = dig::pay_request(&player, &mut db, &mut client, request).await?;
+            let outcome = buy::pay_request(&player, &mut db, &mut client, request).await?;
             println!(
                 "Paid {} payment(s) totalling {} zatoshis (fee {})",
                 outcome.payments, outcome.total_zat, outcome.fee_zat
@@ -327,66 +345,70 @@ fn main() -> anyhow::Result<()> {
             println!("txid: {}", outcome.txid);
             Ok(())
         }),
-        Command::Dig(args) => runtime.block_on(async {
-            let tiles: Vec<u8> = match (args.tile, args.tiles.is_empty()) {
-                (Some(t), _) => vec![t],
-                (None, false) => args.tiles.clone(),
-                (None, true) => anyhow::bail!("pass --tile N or --tiles a,b,c"),
-            };
-            if tiles.iter().any(|t| *t >= zecraft_core::TILE_COUNT) {
-                anyhow::bail!("tiles must be 0..=24");
-            }
-            let mut unique = tiles.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            if unique.len() != tiles.len() {
-                anyhow::bail!("tiles must be distinct");
-            }
+        Command::Buy(args) => runtime.block_on(async {
             let choice = if args.round == "auto" {
                 RoundChoice::Auto
             } else {
                 RoundChoice::Explicit(
                     args.round
                         .parse()
-                        .context("--round must be `auto` or a number")?,
+                        .context("--round must be a number or `auto`")?,
                 )
             };
+            let request = BuyRequest {
+                choice,
+                tickets: args.tickets,
+                payout: args.payout_address,
+                text_memo: args.text_memo,
+            };
             let player = Player::new(secrets.path(), &args.name)?;
-            let (engine_config, board) = dig::fetch_engine(&args.engine).await?;
+            let (engine_config, board) = buy::fetch_engine(&args.engine).await?;
             println!(
                 "Board: round {} ({}) tip {} blocks remaining {}",
                 board.round, board.status, board.tip_height, board.blocks_remaining
             );
-            let mut client = config.connect(zecraft_core::params::Network::Test).await?;
-            let mut db = player.open_db()?;
-            player.ensure_account(&mut db, &mut client).await?;
-            let outcome = dig::dig(
-                &player,
-                &mut db,
-                &mut client,
+            // The wallet is needed to pay, or to hand out a fresh address.
+            let needs_wallet = request.payout == PayoutAddress::Fresh || !args.uri_only;
+            let mut client = None;
+            let mut db = None;
+            if needs_wallet {
+                let mut c = config.connect(zecraft_core::params::Network::Test).await?;
+                let mut d = player.open_db()?;
+                player.ensure_account(&mut d, &mut c).await?;
+                client = Some(c);
+                db = Some(d);
+            }
+            let purchase = buy::prepare_purchase(
                 &engine_config,
                 &board,
-                &dig::DigRequest {
-                    choice,
-                    tiles,
-                    amount_zec: args.amount,
-                },
-            )
-            .await?;
+                &request,
+                db.as_mut().map(|db| (&player, db)),
+            )?;
             println!(
-                "Dug tiles {:?} for round {} with {} zatoshis each (fee {}), target height {}",
-                outcome.tiles,
-                outcome.memo_round,
-                outcome.amount_zat,
-                outcome.fee_zat,
-                outcome.target_height
+                "{} ticket(s) for round {}: {} zatoshis{}",
+                purchase.tickets,
+                purchase.round,
+                purchase.amount_zat,
+                purchase
+                    .diversifier_index
+                    .map(|i| format!(", fresh payout receiver (diversifier index {i})"))
+                    .unwrap_or_default()
+            );
+            if args.uri_only {
+                println!("{}", purchase.uri);
+                return Ok(());
+            }
+            let (Some(db), Some(client)) = (db.as_mut(), client.as_mut()) else {
+                anyhow::bail!("paying needs the player's wallet");
+            };
+            let request = zip321::TransactionRequest::from_uri(&purchase.uri)
+                .map_err(|e| anyhow::anyhow!("payment request: {e:?}"))?;
+            let outcome = buy::pay_request(&player, db, client, request).await?;
+            println!(
+                "Paid {} zatoshis (fee {})",
+                outcome.total_zat, outcome.fee_zat
             );
             println!("txid: {}", outcome.txid);
-            println!(
-                "Sealed {} distinct fresh payout receivers (diversifier indices {:?})",
-                outcome.diversifier_indices.len(),
-                outcome.diversifier_indices
-            );
             Ok(())
         }),
     }

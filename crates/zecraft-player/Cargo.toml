@@ -1,7 +1,7 @@
 [package]
 name = "zecraft-player"
 version = "0.1.0"
-description = "Zeek test player: single-key shielded testnet wallets that dig on the board"
+description = "Zecraft test player: single-key shielded testnet wallets that buy raffle tickets"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ path = "src/main.rs"
 zecraft-core = { path = "../zecraft-core" }
 zecraft-vault = { path = "../zecraft-vault" }
 zecraft-verify = { path = "../zecraft-verify" }
+zecraft-raffle = { path = "../../games/raffle/rules" }
 base64.workspace = true
 
 orchard.workspace = true

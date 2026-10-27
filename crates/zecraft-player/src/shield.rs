@@ -39,7 +39,7 @@ use zecraft_vault::send;
 use zecraft_vault::wallet::{self, Db};
 use zecraft_vault::VaultError;
 
-use crate::wallet::{DigError, Player};
+use crate::wallet::{Player, PlayerError};
 use crate::NETWORK;
 
 /// Shields nothing below this (the ZIP 317 fee of a one-input shielding
@@ -47,14 +47,14 @@ use crate::NETWORK;
 const SHIELDING_THRESHOLD_ZAT: u64 = 100_000;
 
 /// The player's transparent address: BIP 44 external index 0 of its seed.
-pub fn transparent_address(usk: &UnifiedSpendingKey) -> Result<TransparentAddress, DigError> {
+pub fn transparent_address(usk: &UnifiedSpendingKey) -> Result<TransparentAddress, PlayerError> {
     let ivk = usk
         .transparent()
         .to_account_pubkey()
         .derive_external_ivk()
-        .map_err(|e| DigError::Keys(format!("transparent viewing key: {e:?}")))?;
+        .map_err(|e| PlayerError::Keys(format!("transparent viewing key: {e:?}")))?;
     ivk.derive_address(NonHardenedChildIndex::ZERO)
-        .map_err(|e| DigError::Keys(format!("transparent address: {e:?}")))
+        .map_err(|e| PlayerError::Keys(format!("transparent address: {e:?}")))
 }
 
 /// The encoded transparent address (`tm...` on testnet).
@@ -76,11 +76,11 @@ pub async fn shield(
     player: &Player,
     db: &mut Db,
     client: &mut Client,
-) -> Result<ShieldOutcome, DigError> {
+) -> Result<ShieldOutcome, PlayerError> {
     let usk = player.spending_key()?;
     let account = player
         .find_account(db)?
-        .ok_or_else(|| DigError::PlayerMissing(player.name().to_owned()))?;
+        .ok_or_else(|| PlayerError::PlayerMissing(player.name().to_owned()))?;
     // `sync` refreshes the UTXOs of every transparent receiver of the account.
     wallet::sync(db, client).await?;
     let report = wallet::balance(db, account)?;
@@ -112,7 +112,7 @@ pub async fn shield(
         None,
     )
     .map_err(|e| {
-        DigError::Game(format!(
+        PlayerError::Game(format!(
             "nothing to shield at {}: {e}",
             encode_transparent(from)
         ))
@@ -162,7 +162,7 @@ pub async fn shield(
 /// Signs every transparent input with the index-0 external key (the only
 /// address [`shield`] spends from) and any Orchard-protocol spend the
 /// builder added with the player's spend authorizing key.
-fn sign(pczt: Pczt, usk: &UnifiedSpendingKey) -> Result<Pczt, DigError> {
+fn sign(pczt: Pczt, usk: &UnifiedSpendingKey) -> Result<Pczt, PlayerError> {
     let transparent_inputs = pczt.transparent().inputs().len();
     let pending = match send::pending_spends(&pczt) {
         Ok(pending) => pending,
@@ -172,7 +172,7 @@ fn sign(pczt: Pczt, usk: &UnifiedSpendingKey) -> Result<Pczt, DigError> {
     let sk = usk
         .transparent()
         .derive_external_secret_key(NonHardenedChildIndex::ZERO)
-        .map_err(|e| DigError::Keys(format!("transparent key: {e:?}")))?;
+        .map_err(|e| PlayerError::Keys(format!("transparent key: {e:?}")))?;
     let ask = SpendAuthorizingKey::from(usk.orchard());
     let mut signer =
         Signer::new(pczt).map_err(|e| VaultError::Pczt(format!("signer init: {e:?}")))?;

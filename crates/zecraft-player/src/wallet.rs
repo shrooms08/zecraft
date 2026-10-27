@@ -23,7 +23,7 @@ use zecraft_vault::VaultError;
 
 /// Errors of the player tool.
 #[derive(Debug, thiserror::Error)]
-pub enum DigError {
+pub enum PlayerError {
     #[error("player name `{0}` is invalid: use letters, digits, `-` and `_` only")]
     InvalidName(String),
     #[error("player `{0}` already exists; choose another name")]
@@ -50,7 +50,7 @@ pub enum DigError {
     Engine(String),
     #[error("engine returned an unusable response: {0}")]
     EngineResponse(String),
-    #[error("round {round} closes in {blocks_remaining} blocks; refusing to dig with fewer than {margin} blocks of margin")]
+    #[error("round {round} closes in {blocks_remaining} blocks; refusing to buy with fewer than {margin} blocks of margin")]
     ClosingTooSoon {
         round: u32,
         blocks_remaining: u32,
@@ -60,8 +60,8 @@ pub enum DigError {
     Game(String),
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> DigError + '_ {
-    move |source| DigError::Io {
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> PlayerError + '_ {
+    move |source| PlayerError::Io {
         path: path.to_path_buf(),
         source,
     }
@@ -83,14 +83,14 @@ pub struct Player {
 
 impl Player {
     /// Validates `name` and locates its directory.
-    pub fn new(secrets_dir: &Path, name: &str) -> Result<Self, DigError> {
+    pub fn new(secrets_dir: &Path, name: &str) -> Result<Self, PlayerError> {
         let valid = !name.is_empty()
             && name.len() <= 32
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if !valid {
-            return Err(DigError::InvalidName(name.to_owned()));
+            return Err(PlayerError::InvalidName(name.to_owned()));
         }
         Ok(Player {
             name: name.to_owned(),
@@ -113,9 +113,9 @@ impl Player {
     }
 
     /// Creates the player directory and a fresh random seed.
-    pub fn init(&self) -> Result<(), DigError> {
+    pub fn init(&self) -> Result<(), PlayerError> {
         if self.exists() {
-            return Err(DigError::PlayerExists(self.name.clone()));
+            return Err(PlayerError::PlayerExists(self.name.clone()));
         }
         fs::create_dir_all(&self.dir).map_err(io(&self.dir))?;
         set_mode(&self.dir, 0o700)?;
@@ -126,7 +126,7 @@ impl Player {
             seed: hex::encode(seed),
         };
         let path = self.seed_path();
-        let json = serde_json::to_string_pretty(&file).map_err(|e| DigError::Json {
+        let json = serde_json::to_string_pretty(&file).map_err(|e| PlayerError::Json {
             path: path.clone(),
             source: e,
         })?;
@@ -144,43 +144,44 @@ impl Player {
         Ok(())
     }
 
-    fn seed(&self) -> Result<SecretVec<u8>, DigError> {
+    fn seed(&self) -> Result<SecretVec<u8>, PlayerError> {
         if !self.exists() {
-            return Err(DigError::PlayerMissing(self.name.clone()));
+            return Err(PlayerError::PlayerMissing(self.name.clone()));
         }
         let path = self.seed_path();
         let bytes = fs::read(&path).map_err(io(&path))?;
-        let file: SeedFile = serde_json::from_slice(&bytes).map_err(|e| DigError::Json {
+        let file: SeedFile = serde_json::from_slice(&bytes).map_err(|e| PlayerError::Json {
             path: path.clone(),
             source: e,
         })?;
-        let seed = hex::decode(file.seed).map_err(|e| DigError::Keys(format!("seed hex: {e}")))?;
+        let seed =
+            hex::decode(file.seed).map_err(|e| PlayerError::Keys(format!("seed hex: {e}")))?;
         if seed.len() != 32 {
-            return Err(DigError::Keys("seed must be 32 bytes".into()));
+            return Err(PlayerError::Keys("seed must be 32 bytes".into()));
         }
         Ok(SecretVec::new(seed))
     }
 
     /// The player's unified spending key (account 0).
-    pub fn spending_key(&self) -> Result<UnifiedSpendingKey, DigError> {
+    pub fn spending_key(&self) -> Result<UnifiedSpendingKey, PlayerError> {
         let seed = self.seed()?;
         UnifiedSpendingKey::from_seed(&NETWORK, seed.expose_secret(), zip32_account())
-            .map_err(|e| DigError::Keys(format!("{e:?}")))
+            .map_err(|e| PlayerError::Keys(format!("{e:?}")))
     }
 
     /// The player's default unified address (Orchard receiver only).
-    pub fn address(&self) -> Result<String, DigError> {
+    pub fn address(&self) -> Result<String, PlayerError> {
         let ufvk = self.spending_key()?.to_unified_full_viewing_key();
         let (address, _) = ufvk
             .default_address(UnifiedAddressRequest::ORCHARD)
-            .map_err(|e| DigError::Keys(format!("default address: {e}")))?;
+            .map_err(|e| PlayerError::Keys(format!("default address: {e}")))?;
         Ok(address.encode(&NETWORK))
     }
 
     /// Opens the player's wallet database.
-    pub fn open_db(&self) -> Result<Db, DigError> {
+    pub fn open_db(&self) -> Result<Db, PlayerError> {
         if !self.exists() {
-            return Err(DigError::PlayerMissing(self.name.clone()));
+            return Err(PlayerError::PlayerMissing(self.name.clone()));
         }
         Ok(wallet::open(&self.dir, NETWORK)?)
     }
@@ -191,7 +192,7 @@ impl Player {
         &self,
         db: &mut Db,
         client: &mut Client,
-    ) -> Result<AccountUuid, DigError> {
+    ) -> Result<AccountUuid, PlayerError> {
         let usk = self.spending_key()?;
         let ufvk = usk.to_unified_full_viewing_key();
         if let Some(id) = wallet::find_account(db, &ufvk)? {
@@ -201,7 +202,7 @@ impl Player {
         let prior: BlockHeight = tip.saturating_sub(1);
         let tree_state = lightwalletd::tree_state(client, prior).await?;
         let birthday = AccountBirthday::from_treestate(tree_state, None)
-            .map_err(|e| DigError::Keys(format!("birthday tree state: {e:?}")))?;
+            .map_err(|e| PlayerError::Keys(format!("birthday tree state: {e:?}")))?;
         let seed = self.seed()?;
         let (id, _) = db
             .create_account(&self.name, &seed, &birthday, None)
@@ -210,7 +211,7 @@ impl Player {
     }
 
     /// Looks up the account without creating it.
-    pub fn find_account(&self, db: &Db) -> Result<Option<AccountUuid>, DigError> {
+    pub fn find_account(&self, db: &Db) -> Result<Option<AccountUuid>, PlayerError> {
         let ufvk = self.spending_key()?.to_unified_full_viewing_key();
         Ok(wallet::find_account(db, &ufvk)?)
     }
@@ -221,13 +222,13 @@ fn zip32_account() -> zip32::AccountId {
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), DigError> {
+fn set_mode(path: &Path, mode: u32) -> Result<(), PlayerError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io(path))
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), DigError> {
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), PlayerError> {
     Ok(())
 }
 
@@ -275,7 +276,7 @@ mod tests {
         assert!(!player.exists());
         player.init().expect("init");
         assert!(player.exists());
-        assert!(matches!(player.init(), Err(DigError::PlayerExists(_))));
+        assert!(matches!(player.init(), Err(PlayerError::PlayerExists(_))));
         let address = player.address().expect("address");
         assert!(address.starts_with("utest1"));
         assert_eq!(
@@ -294,13 +295,13 @@ mod tests {
         }
         assert!(matches!(
             Player::new(tmp.path(), "../x"),
-            Err(DigError::InvalidName(_))
+            Err(PlayerError::InvalidName(_))
         ));
         assert!(matches!(
             Player::new(tmp.path(), "nobody")
                 .expect("name")
                 .spending_key(),
-            Err(DigError::PlayerMissing(_))
+            Err(PlayerError::PlayerMissing(_))
         ));
     }
 }

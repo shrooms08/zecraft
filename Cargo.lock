@@ -4668,6 +4668,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "zecraft-player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "dotenvy",
+ "hex",
+ "orchard",
+ "pczt",
+ "rand 0.9.5",
+ "rand_core 0.6.4",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zcash_address",
+ "zcash_client_backend",
+ "zcash_client_sqlite",
+ "zcash_keys",
+ "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zcash_transparent",
+ "zecraft-core",
+ "zecraft-raffle",
+ "zecraft-vault",
+ "zecraft-verify",
+ "zip32",
+ "zip321",
+]
+
+[[package]]
 name = "zecraft-raffle"
 version = "0.1.0"
 dependencies = [
@@ -4676,6 +4714,17 @@ dependencies = [
  "serde",
  "serde_json",
  "zecraft-core",
+]
+
+[[package]]
+name = "zecraft-raffle-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "zecraft-engine",
+ "zecraft-keyholder",
+ "zecraft-raffle",
+ "zecraft-verify",
 ]
 
 [[package]]

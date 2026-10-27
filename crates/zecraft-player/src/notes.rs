@@ -17,7 +17,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zecraft_vault::lightwalletd::Client;
 use zecraft_vault::wallet::NoteReport;
 
-use crate::wallet::DigError;
+use crate::wallet::PlayerError;
 
 /// A received note with its decrypted memo.
 pub struct NoteWithMemo {
@@ -35,11 +35,11 @@ pub async fn notes_with_memos(
     client: &mut Client,
     usk: &UnifiedSpendingKey,
     notes: &[NoteReport],
-) -> Result<Vec<NoteWithMemo>, DigError> {
+) -> Result<Vec<NoteWithMemo>, PlayerError> {
     let fvk = usk.to_unified_full_viewing_key();
     let fvk = fvk
         .orchard()
-        .ok_or_else(|| DigError::Keys("wallet has no Orchard key".into()))?;
+        .ok_or_else(|| PlayerError::Keys("wallet has no Orchard key".into()))?;
     let ivks = [
         (
             "external",
@@ -53,7 +53,7 @@ pub async fn notes_with_memos(
     let mut out = Vec::with_capacity(notes.len());
     for note in notes {
         let txid = TxId::from_hex(&note.txid).ok_or_else(|| {
-            DigError::EngineResponse(format!("txid {} is not valid hex", note.txid))
+            PlayerError::EngineResponse(format!("txid {} is not valid hex", note.txid))
         })?;
         let raw = client
             .get_transaction(TxFilter {
@@ -69,7 +69,7 @@ pub async fn notes_with_memos(
             .unwrap_or(u32::try_from(raw.height).unwrap_or(0));
         let branch = BranchId::for_height(&NETWORK, BlockHeight::from_u32(height));
         let tx = Transaction::read(&raw.data[..], branch)
-            .map_err(|e| DigError::EngineResponse(format!("transaction {}: {e}", note.txid)))?;
+            .map_err(|e| PlayerError::EngineResponse(format!("transaction {}: {e}", note.txid)))?;
         let (pool, bundle) = match note.pool {
             ValuePool::Ironwood => (ValuePool::Ironwood, tx.ironwood_bundle()),
             ValuePool::Orchard => (ValuePool::Orchard, tx.orchard_bundle()),
@@ -77,7 +77,7 @@ pub async fn notes_with_memos(
         let action = bundle
             .and_then(|b| b.actions().get(usize::from(note.output_index)))
             .ok_or_else(|| {
-                DigError::EngineResponse(format!(
+                PlayerError::EngineResponse(format!(
                     "{}: action {} missing",
                     note.txid, note.output_index
                 ))
@@ -98,7 +98,7 @@ pub async fn notes_with_memos(
             }
         }
         let (scope, memo) = decrypted.ok_or_else(|| {
-            DigError::EngineResponse(format!(
+            PlayerError::EngineResponse(format!(
                 "{}: action {} does not decrypt with this wallet",
                 note.txid, note.output_index
             ))
@@ -121,11 +121,11 @@ pub async fn notes_in_transaction(
     client: &mut Client,
     usk: &UnifiedSpendingKey,
     txid_hex: &str,
-) -> Result<Vec<NoteWithMemo>, DigError> {
+) -> Result<Vec<NoteWithMemo>, PlayerError> {
     let fvk = usk.to_unified_full_viewing_key();
     let fvk = fvk
         .orchard()
-        .ok_or_else(|| DigError::Keys("wallet has no Orchard key".into()))?;
+        .ok_or_else(|| PlayerError::Keys("wallet has no Orchard key".into()))?;
     let ivks = [
         (
             "external",
@@ -137,7 +137,7 @@ pub async fn notes_in_transaction(
         ),
     ];
     let txid = TxId::from_hex(txid_hex)
-        .ok_or_else(|| DigError::EngineResponse(format!("txid {txid_hex} is not valid hex")))?;
+        .ok_or_else(|| PlayerError::EngineResponse(format!("txid {txid_hex} is not valid hex")))?;
     let raw = client
         .get_transaction(TxFilter {
             block: None,
@@ -150,7 +150,7 @@ pub async fn notes_in_transaction(
     let height = u32::try_from(raw.height).ok().filter(|h| *h > 0);
     let branch = BranchId::for_height(&NETWORK, BlockHeight::from_u32(height.unwrap_or(u32::MAX)));
     let tx = Transaction::read(&raw.data[..], branch)
-        .map_err(|e| DigError::EngineResponse(format!("transaction {txid_hex}: {e}")))?;
+        .map_err(|e| PlayerError::EngineResponse(format!("transaction {txid_hex}: {e}")))?;
     let mut out = Vec::new();
     for (pool, bundle) in [
         (ValuePool::Ironwood, tx.ironwood_bundle()),

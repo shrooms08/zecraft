@@ -184,3 +184,24 @@ default data dirs, proxy header names) and the removal of Zeek-only modules.
 - Everything untracked or ignored in Zeek: `.secrets/`, `data/`, `.env`, `web/`, `target/`,
   `node_modules/`. Also not copied: `config/` (vault and keyholder configs), `scripts/`,
   `apps/`, `packages/`, `crates/zeek-pocket`, the rest of `docs/`.
+
+## Phase B (Zecraft-only changes; the Zeek source column above is unchanged)
+
+Moved: `crates/zecraft-core/src/{beacon,timing,random,rounds}.rs` to `src/draw/`,
+`{memo,seal,payment}.rs` to `src/entry/` (memo and payment rewritten generic);
+`crates/zecraft-engine/src/bin/zecraft-engine.rs` to `src/cli.rs`;
+`crates/zecraft-keyholder/src/main.rs` to `src/cli.rs`;
+`crates/zecraft-verify/src/bin/zecraft-verify.rs` to `src/cli.rs`;
+`crates/zecraft-player/src/dig.rs` to `src/buy.rs`. Every file listed above as
+copied from Zeek has since been modified for the generic kit except the
+vendored `zcash_protocol`, the licences and `docs/examples/`.
+
+Removed (Zeek-only game rules): `crates/zecraft-core/src/{digs,settle,board,proof}.rs`
+(a generic `proof.rs` was written new), `crates/zecraft-core/tests/properties.proptest-regressions`,
+`crates/zecraft-engine/tests/live_artifacts.rs`, `crates/zecraft-verify/src/offline.rs`.
+
+Written new: `crates/zecraft-core/src/{draw/mod.rs,entry/mod.rs,rules.rs,proof.rs}`,
+`crates/zecraft-core/tests/{fixtures_zeek.rs,coin_flip.rs}` (and `properties.rs`
+rewritten), `games/raffle/rules/**`, `games/raffle/server/**`.
+`docs/examples/` stays verbatim: the 26 Zeek files are regression fixtures of
+the generic primitives (`crates/zecraft-core/tests/fixtures_zeek.rs`).

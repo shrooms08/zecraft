@@ -1,0 +1,31 @@
+[package]
+name = "zecraft-raffle-server"
+version = "0.1.0"
+description = "The raffle's processes: round engine, keyholder and verifier, each the kit's generic server with the raffle's Rules"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "zecraft-raffle-engine"
+path = "src/bin/zecraft-raffle-engine.rs"
+
+[[bin]]
+name = "zecraft-raffle-keyholder"
+path = "src/bin/zecraft-raffle-keyholder.rs"
+
+[[bin]]
+name = "zecraft-raffle-verify"
+path = "src/bin/zecraft-raffle-verify.rs"
+
+[dependencies]
+zecraft-raffle = { path = "../rules" }
+zecraft-engine = { path = "../../../crates/zecraft-engine" }
+zecraft-keyholder = { path = "../../../crates/zecraft-keyholder" }
+zecraft-verify = { path = "../../../crates/zecraft-verify", features = ["cli"] }
+anyhow.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }
