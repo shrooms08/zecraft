@@ -21,7 +21,7 @@ use orchard::keys::FullViewingKey;
 use serde::{Deserialize, Serialize};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
-use zecraft_core::seal::{SealingPrivateKey, SealingPublicKey};
+use zecraft_core::entry::seal::{SealingPrivateKey, SealingPublicKey};
 
 use crate::error::VaultError;
 use crate::frost::{self, KeyPackage, PublicKeyPackage};
@@ -489,7 +489,8 @@ mod tests {
             dir.load_sealing_key(),
             Err(VaultError::SealingKeyNotFound(_))
         ));
-        let (sk, pk) = zecraft_core::seal::generate_sealing_keypair(&mut StdRng::seed_from_u64(1));
+        let (sk, pk) =
+            zecraft_core::entry::seal::generate_sealing_keypair(&mut StdRng::seed_from_u64(1));
         let file = SealingKeyFile::new(&sk);
         dir.write_sealing_key(&file, false).expect("write");
         assert!(matches!(

@@ -5,9 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::beacon::{self, BeaconError};
-use crate::params::GameParams;
-use crate::timing::{self, TimingError, TimingVerdict};
+use crate::draw::beacon::{self, BeaconError};
+use crate::draw::timing::{self, TimingError, TimingVerdict};
+use crate::params::ChainParams;
 
 /// Errors from round arithmetic.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -42,7 +42,7 @@ impl RoundWindow {
 }
 
 /// The round that contains `height`, or `None` before the game's genesis.
-pub fn round_for_height(params: &GameParams, height: u32) -> Option<u32> {
+pub fn round_for_height(params: &ChainParams, height: u32) -> Option<u32> {
     if params.blocks_per_round == 0 {
         return None;
     }
@@ -51,23 +51,8 @@ pub fn round_for_height(params: &GameParams, height: u32) -> Option<u32> {
         .map(|offset| offset / params.blocks_per_round)
 }
 
-/// The rules version `round` is played under: 4 once any block of its window
-/// is at or above the Campfire activation height, 3 once any block is at or
-/// above the text-memo activation height, otherwise the fee rules version of
-/// the parameters (1 or 2). Earlier rounds keep their versions.
-pub fn rules_version(params: &GameParams, round: u32) -> Result<u32, RoundError> {
-    let window = round_window(params, round)?;
-    Ok(if params.campfire_active(window.last()) {
-        4
-    } else if params.text_memo_active(window.last()) {
-        3
-    } else {
-        params.rules_version()
-    })
-}
-
 /// The block window of round `round`.
-pub fn round_window(params: &GameParams, round: u32) -> Result<RoundWindow, RoundError> {
+pub fn round_window(params: &ChainParams, round: u32) -> Result<RoundWindow, RoundError> {
     let overflow = || RoundError::Overflow(round);
     let start = round
         .checked_mul(params.blocks_per_round)
@@ -83,17 +68,17 @@ pub fn round_window(params: &GameParams, round: u32) -> Result<RoundWindow, Roun
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoundStatus {
-    /// Digs are being accepted: the chain tip is inside the window.
+    /// Entries are being accepted: the chain tip is inside the window.
     Open,
     /// The window has closed but the `mtp_window` blocks after it, whose
     /// timestamps decide the timing rule, are not all mined yet.
     Closing,
     /// The timing rule passed: the beacon bound to this round, once
-    /// published, reveals the treasure.
+    /// published, decides it.
     Revealable,
     /// The round was settled (payouts computed).
     Settled,
-    /// The timing rule failed: every decodable dig is refunded, nothing is
+    /// The timing rule failed: every decodable entry is refunded, nothing is
     /// drawn. This is final; a voided round is never `Settled`.
     Voided,
 }
@@ -114,7 +99,7 @@ pub struct RoundContext {
 
 /// Computes the round's status from its on-chain context.
 pub fn round_status(
-    params: &GameParams,
+    params: &ChainParams,
     round: u32,
     ctx: &RoundContext,
 ) -> Result<RoundStatus, RoundError> {
@@ -142,23 +127,8 @@ pub fn round_status(
 mod tests {
     use super::*;
 
-    fn params() -> GameParams {
-        GameParams::testnet(1_000)
-    }
-
-    #[test]
-    fn rules_version_switches_at_the_activation_round() {
-        let mut p = params();
-        assert_eq!(rules_version(&p, 0).expect("v"), 2);
-        let w1 = round_window(&p, 1).expect("window");
-        // Activation in the middle of round 1: rounds 1 and later are v3.
-        p.text_memo_activation_height = Some(w1.start + 5);
-        assert_eq!(rules_version(&p, 0).expect("v"), 2);
-        assert_eq!(rules_version(&p, 1).expect("v"), 3);
-        assert_eq!(rules_version(&p, 9).expect("v"), 3);
-        p.dig_fee_zat = 0;
-        p.text_memo_activation_height = None;
-        assert_eq!(rules_version(&p, 9).expect("v"), 1);
+    fn params() -> ChainParams {
+        ChainParams::testnet(1_000)
     }
 
     #[test]

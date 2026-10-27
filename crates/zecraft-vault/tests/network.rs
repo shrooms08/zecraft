@@ -29,7 +29,8 @@ use zecraft_vault::{frost, keys, lightwalletd, wallet};
 
 fn lightwalletd_url() -> String {
     let _ = dotenvy::dotenv();
-    env::var("ZECRAFT_LIGHTWALLETD_URL").expect("ZECRAFT_LIGHTWALLETD_URL must be set (see .env.example)")
+    env::var("ZECRAFT_LIGHTWALLETD_URL")
+        .expect("ZECRAFT_LIGHTWALLETD_URL must be set (see .env.example)")
 }
 
 #[tokio::test]

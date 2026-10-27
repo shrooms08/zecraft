@@ -5,9 +5,9 @@
 //! public key, while any tampering must be rejected.
 
 use serde::Deserialize;
-use zecraft_core::beacon::{self, Beacon, BeaconError};
-use zecraft_core::params::{DrandChain, GameParams};
-use zecraft_core::random;
+use zecraft_core::draw::beacon::{self, Beacon, BeaconError};
+use zecraft_core::draw::random;
+use zecraft_core::params::{ChainParams, DrandChain};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -35,8 +35,8 @@ fn real_quicknet_beacons_verify() {
         let randomness = beacon::verify_beacon(&f.chain, b).expect("real beacon verifies");
         // Randomness is sha256(signature), 32 bytes, and feeds the draws.
         assert_ne!(randomness.0, [0u8; 32]);
-        let tile = random::treasure_tile(1, &randomness).expect("tile");
-        assert!(tile < 25);
+        let draw = random::uniform_below(b"test/draw/v1", 1, &randomness, 25).expect("draw");
+        assert!(draw < 25);
     }
     // Round 1's randomness pins the derivation against the drand reference.
     let first = f.beacons.iter().find(|b| b.round == 1).expect("round 1");
@@ -81,7 +81,7 @@ fn tampered_beacons_are_rejected() {
 
 #[test]
 fn fixture_rounds_sit_at_their_published_times() {
-    let p = GameParams::testnet(1);
+    let p = ChainParams::testnet(1);
     let f = fixture();
     for b in &f.beacons {
         let t = beacon::beacon_time(&p, b.round).expect("time");

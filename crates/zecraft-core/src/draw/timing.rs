@@ -3,10 +3,10 @@
 //!
 //! # Timing safety argument
 //!
-//! **Threat.** A dig only counts if it is in a block inside the round's window
-//! `[start, end)`. Nobody (miner or player) may be able to get a dig counted
-//! after the beacon bound to the round is known, otherwise they could dig the
-//! treasure tile with certainty. The beacon for drand round `n` is published
+//! **Threat.** An entry only counts if it is in a block inside the round's window
+//! `[start, end)`. Nobody (miner or player) may be able to get an entry counted
+//! after the beacon bound to the round is known, otherwise they could pick the
+//! winning entry with certainty. The beacon for drand round `n` is published
 //! at `T_n = genesis_time + (n − 1)·period` (drand `common/time.go`), so what
 //! must hold is: every block of the window was mined before `T_n`.
 //!
@@ -39,9 +39,9 @@
 //! carry timestamps `≥ real time − δ ≥ real(L) − δ`; the median of 11 values
 //! is the 6th smallest, so `M ≥ real(L) − δ`, i.e. `real(L) ≤ M + δ`. Hence if
 //! `M + δ < T_n`, every window block was mined before the beacon existed, and
-//! no dig could have been placed with knowledge of it. If the inequality does
+//! no entry could have been placed with knowledge of it. If the inequality does
 //! not hold the chain does not prove safety, and the round is **voided**:
-//! every decodable dig is refunded and nothing is drawn.
+//! every decodable entry is refunded and nothing is drawn.
 //!
 //! **Why this is not griefable into theft.** An adversary can lower its own
 //! timestamps (down to the median) but cannot lower honest ones, so it cannot
@@ -50,13 +50,13 @@
 //! schedule only through the start block's timestamp (bounded above by
 //! median + 90 min), which merely postpones the reveal.
 //!
-//! The reveal delay in [`GameParams`](crate::params::GameParams) is sized so
+//! The reveal delay in [`ChainParams`](crate::params::ChainParams) is sized so
 //! that an honest chain running at up to twice the target spacing passes this
-//! rule; see `GameParams::minimum_reveal_delay`.
+//! rule; see `ChainParams::minimum_reveal_delay`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::params::GameParams;
+use crate::params::ChainParams;
 
 /// Errors from the timing rule.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub fn median_time_past(times: &[u64]) -> Option<u64> {
 /// Applies the timing rule to the `nTime` values of the blocks that follow the
 /// window (at least `mtp_window` of them, in height order).
 pub fn check_window_close(
-    params: &GameParams,
+    params: &ChainParams,
     beacon_time: u64,
     post_close_block_times: &[u64],
 ) -> Result<TimingVerdict, TimingError> {
@@ -144,10 +144,10 @@ pub fn check_window_close(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon;
+    use crate::draw::beacon;
 
-    fn params() -> GameParams {
-        GameParams::testnet(1)
+    fn params() -> ChainParams {
+        ChainParams::testnet(1)
     }
 
     /// Honest timestamps: real time, blocks every `spacing` seconds after the close.
@@ -155,7 +155,7 @@ mod tests {
         (0..n as u64).map(|i| close + spacing * (i + 1)).collect()
     }
 
-    fn beacon_time_for_start(p: &GameParams, start: u64) -> u64 {
+    fn beacon_time_for_start(p: &ChainParams, start: u64) -> u64 {
         let r = beacon::beacon_round_for(p, start).expect("round");
         beacon::beacon_time(p, r).expect("time")
     }

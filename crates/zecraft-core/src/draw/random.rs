@@ -4,19 +4,13 @@
 //! read as big-endian `u32` words, accepted only when the word is below the
 //! largest multiple of `n` that fits in 32 bits (rejection sampling, so no
 //! modulo bias), and extended with a fresh counter when a whole digest is
-//! rejected. The treasure tile and the Deep Cache trigger use different
-//! domains so they are independent draws from the same beacon.
+//! rejected. The domain is the caller's: each game, and each independent
+//! draw within a game, uses its own, so draws from the same beacon are
+//! independent of each other.
 
 use sha2::{Digest, Sha256};
 
-use crate::beacon::Randomness;
-use crate::params::GameParams;
-use crate::TILE_COUNT;
-
-/// Domain separator of the treasure-tile draw.
-pub const TREASURE_DOMAIN: &[u8] = b"zeek/treasure/v1";
-/// Domain separator of the Deep Cache draw.
-pub const CACHE_DOMAIN: &[u8] = b"zeek/cache/v1";
+use crate::draw::beacon::Randomness;
 
 /// Errors from drawing.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -27,7 +21,7 @@ pub enum RandomError {
     Exhausted,
 }
 
-/// Draws a uniformly distributed value in `0..n`.
+/// Draws a uniformly distributed value in `0..n` for `round` under `domain`.
 pub fn uniform_below(
     domain: &[u8],
     round: u32,
@@ -56,24 +50,12 @@ pub fn uniform_below(
     Err(RandomError::Exhausted)
 }
 
-/// The treasure tile (0..25) of `round`.
-pub fn treasure_tile(round: u32, randomness: &Randomness) -> Result<u8, RandomError> {
-    let tile = uniform_below(TREASURE_DOMAIN, round, randomness, u32::from(TILE_COUNT))?;
-    u8::try_from(tile).map_err(|_| RandomError::Exhausted)
-}
-
-/// Whether the Deep Cache breaks open in `round` (value 0 of `0..cache_odds`).
-pub fn cache_triggers(
-    params: &GameParams,
-    round: u32,
-    randomness: &Randomness,
-) -> Result<bool, RandomError> {
-    Ok(uniform_below(CACHE_DOMAIN, round, randomness, params.cache_odds)? == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: &[u8] = b"test/a/v1";
+    const B: &[u8] = b"test/b/v1";
 
     fn randomness(seed: u8) -> Randomness {
         Randomness([seed; 32])
@@ -82,40 +64,36 @@ mod tests {
     #[test]
     fn draws_are_deterministic_and_in_range() {
         let r = randomness(7);
-        let a = treasure_tile(3, &r).expect("tile");
-        let b = treasure_tile(3, &r).expect("tile");
-        assert_eq!(a, b);
-        assert!(a < TILE_COUNT);
+        let a = uniform_below(A, 3, &r, 25).expect("draw");
+        assert_eq!(a, uniform_below(A, 3, &r, 25).expect("draw"));
+        assert!(a < 25);
         assert_ne!(
-            uniform_below(TREASURE_DOMAIN, 3, &r, 1_000_000).expect("v"),
-            uniform_below(CACHE_DOMAIN, 3, &r, 1_000_000).expect("v"),
+            uniform_below(A, 3, &r, 1_000_000).expect("v"),
+            uniform_below(B, 3, &r, 1_000_000).expect("v"),
             "domains must separate the draws"
         );
         assert_ne!(
-            treasure_tile(3, &r).expect("t"),
-            treasure_tile(4, &randomness(8)).expect("t")
+            uniform_below(A, 3, &r, 1_000_000).expect("v"),
+            uniform_below(A, 4, &r, 1_000_000).expect("v"),
+            "rounds must separate the draws"
         );
-        assert_eq!(uniform_below(TREASURE_DOMAIN, 0, &r, 1).expect("v"), 0);
-        assert_eq!(
-            uniform_below(TREASURE_DOMAIN, 0, &r, 0),
-            Err(RandomError::EmptyRange)
-        );
+        assert_eq!(uniform_below(A, 0, &r, 1).expect("v"), 0);
+        assert_eq!(uniform_below(A, 0, &r, 0), Err(RandomError::EmptyRange));
     }
 
     #[test]
-    fn known_answer_is_stable() {
-        // Regression pin computed from this implementation on 2026-10-13, so
-        // that engine, keyholders and browser verifier can never silently
-        // disagree once deployed.
+    fn known_answer_is_stable_under_the_original_zeek_domains() {
+        // Zeek's regression pin of 2026-10-13, now with its domains passed in
+        // by the caller: engine, keyholders and verifiers can never silently
+        // disagree on a draw.
         let r = Randomness(
             hex::decode("7f7f0a0e0e2c1c84a4c9f5fcd5b06b8f45b6b9a3a2d8c0e1f2a3b4c5d6e7f809")
                 .expect("hex")
                 .try_into()
                 .expect("32 bytes"),
         );
-        let p = GameParams::testnet(1);
-        let tile = treasure_tile(42, &r).expect("tile");
-        let cache = uniform_below(CACHE_DOMAIN, 42, &r, p.cache_odds).expect("cache");
+        let tile = uniform_below(b"zeek/treasure/v1", 42, &r, 25).expect("tile");
+        let cache = uniform_below(b"zeek/cache/v1", 42, &r, 625).expect("cache");
         assert_eq!((tile, cache), (20, 283));
     }
 }

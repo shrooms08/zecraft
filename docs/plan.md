@@ -60,7 +60,7 @@ The browser wallet (Pocket) is **not** in the 24-hour kit. It stays a later modu
 
 ## 4. Hosting
 
-Create a **new Railway project `zecraft-testnet` with one service**. Its entrypoint starts keyholders 1–3 on `127.0.0.1:9201-9203`, then runs the engine. The engine also serves the relay and the web page, so there is one public domain and one volume (`/data/{engine,kh1,kh2,kh3}`). Reuse Zeek's Dockerfile pattern: zigbuild binaries, SHA256SUMS check, wait for `.imported`, then `setpriv`. The DKG runs on the Mac and the volume is imported, as for Zeek.
+Create a **new Railway project `zecraft-testnet` with one service**. Its entrypoint starts keyholders 1–3 on `127.0.0.1:7701-7703`, then runs the engine on `7787`; the relay listens on `7790`. These ports are Zecraft's own (amended in Phase B), so a Zecraft and a Zeek stack can run on the same Mac. The engine also serves the web page, so there is one public domain and one volume (`/data/{engine,kh1,kh2,kh3}`). Reuse Zeek's Dockerfile pattern: zigbuild binaries, SHA256SUMS check, wait for `.imported`, then `setpriv`. The DKG runs on the Mac and the volume is imported, as for Zeek.
 
 **Cost:** about $1–2 a month. Zeek measured $1.70 for engine plus 3 keyholders plus relay at about 190 MB. This fits in the Hobby plan's included usage.
 

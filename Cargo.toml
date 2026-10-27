@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/zecraft-core", "crates/zecraft-vault", "crates/zecraft-engine", "crates/zecraft-player", "crates/zecraft-keyholder", "crates/zecraft-verify"]
+# Phase B, temporarily: engine, keyholder, verify and player rejoin once they
+# are generic over `Rules` (B3, B4); until then they still speak Zeek's rules.
+members = ["crates/zecraft-core", "crates/zecraft-vault"]
+exclude = ["crates/zecraft-engine", "crates/zecraft-player", "crates/zecraft-keyholder", "crates/zecraft-verify"]
 
 [workspace.package]
 edition = "2021"

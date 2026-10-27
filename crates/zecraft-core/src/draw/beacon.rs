@@ -13,7 +13,7 @@
 //! # Binding a game round to a drand round
 //!
 //! `beacon_round_for(params, t_start)` with `t_start` the `nTime` of the
-//! round's first block (public once that block is mined, before any dig of the
+//! round's first block (public once that block is mined, before any entry of the
 //! round can be confirmed):
 //!
 //! ```text
@@ -32,7 +32,7 @@
 use drand_verify::{G2PubkeyRfc, Pubkey};
 use serde::{Deserialize, Serialize};
 
-use crate::params::{DrandChain, GameParams, ParamsError, SCHEME_BLS_UNCHAINED_G1_RFC9380};
+use crate::params::{ChainParams, DrandChain, ParamsError, SCHEME_BLS_UNCHAINED_G1_RFC9380};
 
 /// Errors from beacon handling.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub fn verify_beacon(chain: &DrandChain, beacon: &Beacon) -> Result<Randomness, 
 }
 
 /// Unix time at which drand round `round` (≥ 1) is published.
-pub fn beacon_time(params: &GameParams, round: u64) -> Result<u64, BeaconError> {
+pub fn beacon_time(params: &ChainParams, round: u64) -> Result<u64, BeaconError> {
     if round == 0 {
         return Err(BeaconError::RoundZero);
     }
@@ -131,7 +131,7 @@ pub fn beacon_time(params: &GameParams, round: u64) -> Result<u64, BeaconError> 
 }
 
 /// The latest drand round published at or before `time` (0 before genesis).
-pub fn latest_round_at(params: &GameParams, time: u64) -> Result<u64, BeaconError> {
+pub fn latest_round_at(params: &ChainParams, time: u64) -> Result<u64, BeaconError> {
     if params.drand.period_secs == 0 {
         return Err(ParamsError::ZeroDrandPeriod.into());
     }
@@ -142,7 +142,7 @@ pub fn latest_round_at(params: &GameParams, time: u64) -> Result<u64, BeaconErro
 }
 
 /// The first drand round published at or after `time`.
-pub fn round_at_or_after(params: &GameParams, time: u64) -> Result<u64, BeaconError> {
+pub fn round_at_or_after(params: &ChainParams, time: u64) -> Result<u64, BeaconError> {
     if params.drand.period_secs == 0 {
         return Err(ParamsError::ZeroDrandPeriod.into());
     }
@@ -154,7 +154,7 @@ pub fn round_at_or_after(params: &GameParams, time: u64) -> Result<u64, BeaconEr
 
 /// The drand round bound to the game round whose first block has `nTime`
 /// `start_block_time`; see the module docs for the formula.
-pub fn beacon_round_for(params: &GameParams, start_block_time: u64) -> Result<u64, BeaconError> {
+pub fn beacon_round_for(params: &ChainParams, start_block_time: u64) -> Result<u64, BeaconError> {
     let t_reveal = start_block_time
         .checked_add(params.round_duration_secs()?)
         .and_then(|t| t.checked_add(params.reveal_delay_secs))
@@ -166,8 +166,8 @@ pub fn beacon_round_for(params: &GameParams, start_block_time: u64) -> Result<u6
 mod tests {
     use super::*;
 
-    fn params() -> GameParams {
-        GameParams::testnet(1)
+    fn params() -> ChainParams {
+        ChainParams::testnet(1)
     }
 
     #[test]

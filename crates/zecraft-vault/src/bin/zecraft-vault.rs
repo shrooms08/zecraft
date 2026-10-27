@@ -112,7 +112,7 @@ fn sealing_keygen(secrets: &SecretsDir, args: SealingKeygenArgs) -> anyhow::Resu
     // `OsRng` is fallible in rand 0.9; `unwrap_err` adapts it to the infallible
     // `CryptoRng` the sealing keygen needs (an OS RNG failure aborts keygen).
     let mut rng = rand_09::rngs::OsRng.unwrap_err();
-    let (private_key, public_key) = zecraft_core::seal::generate_sealing_keypair(&mut rng);
+    let (private_key, public_key) = zecraft_core::entry::seal::generate_sealing_keypair(&mut rng);
     let file = SealingKeyFile::new(&private_key);
     secrets.write_sealing_key(&file, args.force)?;
     println!(

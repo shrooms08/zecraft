@@ -1,12 +1,17 @@
 //! Sealing of payout receivers with HPKE (RFC 9180).
 //!
-//! The board's viewing key is public, so every dig memo is readable by anyone.
-//! If the payout receiver were in the clear, an observer could link every dig
-//! that shares a payout address. Instead the receiver is encrypted to the
-//! vault's **payout sealing key** with HPKE base mode
+//! The vault's viewing key is public, so every entry memo is readable by
+//! anyone. If the payout receiver were in the clear, an observer could link
+//! every entry that shares a payout address. Instead the receiver is
+//! encrypted to the vault's **payout sealing key** with HPKE base mode
 //! (`DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20Poly1305`), and the
-//! dig's public header (magic, version, round, tile) is bound in as AAD so a
-//! sealed receiver cannot be cut from one dig and pasted onto another.
+//! entry's public header (magic, version, round, payload) is bound in as AAD
+//! so a sealed receiver cannot be cut from one entry and pasted onto another.
+//!
+//! The HPKE `info` string fixes the application context of the key schedule.
+//! It is the caller's (each game names its own, see
+//! [`crate::entry::MemoFormat::seal_info`]), so a receiver sealed for one game
+//! never opens under another's context.
 //!
 //! Randomness for the ephemeral key is supplied by the caller (a
 //! `rand_core 0.9` [`CryptoRng`] + [`RngCore`]); this crate never reaches for
@@ -24,8 +29,6 @@ use serde::{Deserialize, Serialize};
 /// The KEM every sealing key uses.
 pub type Kem = X25519HkdfSha256;
 
-/// HPKE `info` string, fixing the application context of the key schedule.
-pub const SEAL_INFO: &[u8] = b"zeek/payout-seal/v1";
 /// Size of an X25519 encapsulated key.
 pub const ENCAPPED_KEY_LEN: usize = 32;
 /// Size of a ChaCha20Poly1305 authentication tag.
@@ -122,11 +125,13 @@ pub fn generate_sealing_keypair<R: CryptoRng + RngCore>(
     (SealingPrivateKey(sk), SealingPublicKey(pk))
 }
 
-/// Seals `plaintext` to `recipient` with `aad` bound in.
+/// Seals `plaintext` to `recipient` under the HPKE context `info`, with
+/// `aad` bound in.
 ///
 /// Returns `encapped_key || ciphertext`, where the ciphertext is
 /// `plaintext.len() + 16` bytes.
 pub fn seal<R: CryptoRng + RngCore>(
+    info: &[u8],
     recipient: &SealingPublicKey,
     plaintext: &[u8],
     aad: &[u8],
@@ -135,7 +140,7 @@ pub fn seal<R: CryptoRng + RngCore>(
     let (encapped, ciphertext) = hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, Kem, R>(
         &OpModeS::Base,
         &recipient.0,
-        SEAL_INFO,
+        info,
         plaintext,
         aad,
         rng,
@@ -147,8 +152,14 @@ pub fn seal<R: CryptoRng + RngCore>(
     Ok(out)
 }
 
-/// Opens data produced by [`seal`]; fails if the key or the AAD differ.
-pub fn open(key: &SealingPrivateKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SealError> {
+/// Opens data produced by [`seal`]; fails if the context, the key or the AAD
+/// differ.
+pub fn open(
+    info: &[u8],
+    key: &SealingPrivateKey,
+    sealed: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SealError> {
     if sealed.len() < ENCAPPED_KEY_LEN + TAG_LEN {
         return Err(SealError::TooShort);
     }
@@ -159,7 +170,7 @@ pub fn open(key: &SealingPrivateKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8
         &OpModeR::Base,
         &key.0,
         &encapped,
-        SEAL_INFO,
+        info,
         ciphertext,
         aad,
     )
@@ -176,22 +187,32 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
+    const INFO: &[u8] = b"test/payout-seal/v1";
+
     #[test]
     fn seal_open_round_trip_and_tamper_detection() {
         let mut rng = StdRng::seed_from_u64(1);
         let (sk, pk) = generate_sealing_keypair(&mut rng);
         assert_eq!(sk.public_key(), pk);
-        let sealed = seal(&pk, b"hello", b"aad", &mut rng).expect("seal");
+        let sealed = seal(INFO, &pk, b"hello", b"aad", &mut rng).expect("seal");
         assert_eq!(sealed.len(), ENCAPPED_KEY_LEN + 5 + TAG_LEN);
-        assert_eq!(open(&sk, &sealed, b"aad").expect("open"), b"hello");
+        assert_eq!(open(INFO, &sk, &sealed, b"aad").expect("open"), b"hello");
 
-        assert_eq!(open(&sk, &sealed, b"other"), Err(SealError::Open));
+        assert_eq!(open(INFO, &sk, &sealed, b"other"), Err(SealError::Open));
+        assert_eq!(
+            open(b"another/game/v1", &sk, &sealed, b"aad"),
+            Err(SealError::Open),
+            "the HPKE context separates games"
+        );
         let (other_sk, _) = generate_sealing_keypair(&mut rng);
-        assert_eq!(open(&other_sk, &sealed, b"aad"), Err(SealError::Open));
+        assert_eq!(open(INFO, &other_sk, &sealed, b"aad"), Err(SealError::Open));
         let mut corrupted = sealed.clone();
         corrupted[40] ^= 1;
-        assert_eq!(open(&sk, &corrupted, b"aad"), Err(SealError::Open));
-        assert_eq!(open(&sk, &sealed[..40], b"aad"), Err(SealError::TooShort));
+        assert_eq!(open(INFO, &sk, &corrupted, b"aad"), Err(SealError::Open));
+        assert_eq!(
+            open(INFO, &sk, &sealed[..40], b"aad"),
+            Err(SealError::TooShort)
+        );
     }
 
     #[test]
