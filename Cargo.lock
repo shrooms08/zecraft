@@ -4859,7 +4859,9 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake2b_simd",
+ "bls12_381",
  "clap",
+ "drand-verify",
  "hex",
  "incrementalmerkletree",
  "nonempty",
@@ -4871,6 +4873,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.9.9",
  "thiserror 2.0.21",
  "tokio",
  "tonic",
@@ -4883,6 +4886,7 @@ dependencies = [
  "zcash_primitives",
  "zcash_protocol",
  "zecraft-core",
+ "zecraft-raffle",
 ]
 
 [[package]]
