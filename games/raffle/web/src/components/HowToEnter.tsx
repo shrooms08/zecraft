@@ -9,43 +9,29 @@ import { QrCode } from "./QrCode";
 const MIN_BLOCKS_LEFT = 4;
 
 export function HowToEnter({ config, configJson, board }: { config: GameConfig | null; configJson: string | null; board: Board | null }) {
-  if (!config || !configJson) return <p>Loading the game config…</p>;
-  if (!config.entries_open || !config.vault_address) {
-    return <p>Entries are closed on this engine.</p>;
-  }
   return (
-    <div className="how-to-enter">
-      <h3>How to enter</h3>
-      <ol className="steps">
-        <li>Choose how many tickets ({taz(config.game.ticket_price_zat)} TAZ each).</li>
-        <li>Paste a fresh shielded address of your own wallet: winnings go there.</li>
-        <li>Pay the request below. The payout address is sealed in your browser, so only the vault's keyholders can open it, and only if you win.</li>
-      </ol>
-      <VaultAddress address={config.vault_address} />
-      <EntryForm configJson={configJson} board={board} />
-      <p className="note">Pay from an NU7 testnet wallet or zecraft-player.</p>
+    <div className="panel how-to-enter" data-component="HowToEnter">
+      <div className="label">how to enter</div>
+      {!config || !configJson ? (
+        <p className="muted small">Loading the game config...</p>
+      ) : !config.entries_open || !config.vault_address ? (
+        <p className="muted">Entries are closed on this engine.</p>
+      ) : (
+        <Steps config={config} configJson={configJson} board={board} vault={config.vault_address} />
+      )}
     </div>
   );
 }
 
-function VaultAddress({ address }: { address: string }) {
-  return (
-    <div className="vault-address">
-      <h4>Vault address</h4>
-      <p className="mono break">{address}</p>
-      <CopyButton text={address} label="Copy address" />
-      <QrCode value={address} label="QR code of the vault address" />
-    </div>
-  );
-}
-
-function EntryForm({ configJson, board }: { configJson: string; board: Board | null }) {
-  const [tickets, setTickets] = useState(1);
+function Steps({ config, configJson, board, vault }: { config: GameConfig; configJson: string; board: Board | null; vault: string }) {
+  const [tickets, setTickets] = useState("2");
   const [payout, setPayout] = useState("");
   const [textMemo, setTextMemo] = useState(false);
   const [entry, setEntry] = useState<Entry | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const price = config.game.ticket_price_zat;
+  const n = Math.max(1, Math.min(1000, Math.floor(Number(tickets)) || 1));
   const closing = !board || board.status !== "open" || board.blocks_remaining < MIN_BLOCKS_LEFT;
 
   async function submit(event: React.FormEvent) {
@@ -55,7 +41,7 @@ function EntryForm({ configJson, board }: { configJson: string; board: Board | n
     setError(null);
     setEntry(null);
     try {
-      setEntry(await sealEntry(configJson, board.round, tickets, payout.trim(), textMemo));
+      setEntry(await sealEntry(configJson, board.round, n, payout.trim(), textMemo));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -63,45 +49,95 @@ function EntryForm({ configJson, board }: { configJson: string; board: Board | n
     }
   }
 
-  return (
-    <form className="entry-form" onSubmit={submit}>
-      <h4>Build your entry</h4>
-      <label>
-        Tickets
-        <input type="number" min={1} max={1000} value={tickets} required onChange={(e) => setTickets(Number(e.target.value))} />
-      </label>
-      <label>
-        Your fresh payout address
-        <input type="text" value={payout} required placeholder="utest1…" spellCheck={false} autoComplete="off" onChange={(e) => setPayout(e.target.value)} />
-      </label>
-      <label className="checkbox">
-        <input type="checkbox" checked={textMemo} onChange={(e) => setTextMemo(e.target.checked)} />
-        Text memo (for wallets that only send text memos)
-      </label>
-      {closing && board && <p className="warning">Round {board.round} closes in {board.blocks_remaining} blocks: wait for the next round.</p>}
-      <button type="submit" className="button primary" disabled={busy || closing}>
-        {busy ? "Sealing…" : `Build the request for round ${board?.round ?? "…"}`}
-      </button>
-      {error && <p className="error" role="alert">{error}</p>}
-      {entry && <EntryRequest entry={entry} payout={payout.trim()} textMemo={textMemo} />}
-    </form>
-  );
-}
+  const cliPayout = payout.trim() || "<your utest1 address>";
+  const cliRound = entry?.round ?? board?.round ?? "<round>";
+  const cli = `zecraft-player buy <name> --tickets ${n} --round ${cliRound} --payout-address ${cliPayout}${textMemo ? " --text-memo" : ""}`;
 
-function EntryRequest({ entry, payout, textMemo }: { entry: Entry; payout: string; textMemo: boolean }) {
-  const cli = `zecraft-player buy <name> --tickets ${entry.tickets} --round ${entry.round} --payout-address ${payout}${textMemo ? " --text-memo" : ""}`;
   return (
-    <div className="entry-request" aria-live="polite">
-      <p>
-        {entry.tickets} ticket{entry.tickets === 1 ? "" : "s"} for round {entry.round}: pay exactly {taz(entry.amount_zat)} TAZ.
-      </p>
-      <p className="mono break">{entry.uri}</p>
-      <CopyButton text={entry.uri} label="Copy request" />
-      <QrCode value={entry.uri} label="QR code of the payment request" />
-      <details>
-        <summary>Same entry with zecraft-player</summary>
-        <p className="mono break">{cli}</p>
-      </details>
-    </div>
+    <ol className="enter-steps">
+      <li>
+        <span className="step-num" aria-hidden="true">1</span>
+        <div className="step-body">
+          <span className="step-head">Copy the vault address</span>
+          <div className="vault-row">
+            <div className="vault-text">
+              <code className="addr">{vault}</code>
+              <CopyButton text={vault} label="Copy address" />
+            </div>
+            <QrCode value={vault} label="QR code of the vault address" size={132} />
+          </div>
+        </div>
+      </li>
+      <li>
+        <span className="step-num" aria-hidden="true">2</span>
+        <form className="step-body" onSubmit={submit}>
+          <span className="step-head">Choose your tickets</span>
+          <div className="form-row">
+            <div className="field field-tickets">
+              <label htmlFor="zc-tickets">Tickets</label>
+              <input id="zc-tickets" type="number" min={1} max={1000} value={tickets} required onChange={(e) => setTickets(e.target.value)} />
+            </div>
+            <div className="field field-payout">
+              <label htmlFor="zc-payout">Your payout address (fresh, goes in the shielded memo)</label>
+              <input id="zc-payout" type="text" value={payout} required placeholder="utest1..." spellCheck={false} autoComplete="off" onChange={(e) => setPayout(e.target.value)} />
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={busy || closing}>
+              {busy ? "Sealing..." : "Create payment"}
+            </button>
+          </div>
+          <label className="checkbox">
+            <input type="checkbox" checked={textMemo} onChange={(e) => setTextMemo(e.target.checked)} />
+            Text memo (for wallets that only send text memos)
+          </label>
+          <span className="mono muted small">
+            Total: {taz(price * n)} TAZ ({n} × {taz(price)})
+          </span>
+          {closing && board && (
+            <p className="warn small" role="status">
+              Round {board.round} is {board.status === "open" ? `closing in ${board.blocks_remaining} blocks` : "closed"}: wait for the next round to open.
+            </p>
+          )}
+          {error && (
+            <p className="error small" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+      </li>
+      <li>
+        <span className="step-num" aria-hidden="true">3</span>
+        <div className="step-body">
+          <span className="step-head">Pay the vault</span>
+          <div aria-live="polite">
+            {entry ? (
+              <div className="entry-request">
+                <div className="entry-text">
+                  <span>
+                    Send <strong className="mono">{taz(entry.amount_zat)} TAZ</strong> for {entry.tickets} ticket{entry.tickets === 1 ? "" : "s"} in round {entry.round}. The link includes your memo.
+                  </span>
+                  <a className="btn btn-primary btn-sm" href={entry.uri}>
+                    Open payment link
+                  </a>
+                  <code className="entry-uri" title={entry.uri}>
+                    {entry.uri.slice(0, 22)}…{entry.uri.slice(-18)}
+                  </code>
+                  <CopyButton text={entry.uri} label="Copy payment link" />
+                </div>
+                <QrCode value={entry.uri} label="QR code of the payment request" size={148} />
+              </div>
+            ) : (
+              <p className="placeholder">Fill in step 2 to get a payment link and QR.</p>
+            )}
+          </div>
+          <p className="muted small">Pay from an NU7 testnet wallet or zecraft-player.</p>
+          <details className="cli">
+            <summary>Use the CLI instead</summary>
+            <pre>
+              <span className="tok-prompt">$</span> {cli}
+            </pre>
+          </details>
+        </div>
+      </li>
+    </ol>
   );
 }

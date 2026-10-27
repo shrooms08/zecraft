@@ -1,39 +1,44 @@
-import type { Board, GameConfig, RoundSummary } from "../api";
+import type { Board, GameConfig, PendingRound, RoundSummary } from "../api";
 import { CurrentRound } from "./CurrentRound";
 import { HowToEnter } from "./HowToEnter";
 import { PastRounds } from "./PastRounds";
-import { Section } from "./Section";
+import { PixelIcon } from "./Pixel";
+import { VerifyRound, type VerifyRequest } from "./VerifyRound";
 
 interface Props {
   board: Board | null;
   config: GameConfig | null;
   configJson: string | null;
   rounds: RoundSummary[] | null;
+  pending: PendingRound[] | null;
   error: string | null;
+  verify: VerifyRequest;
+  onVerify: (round: number) => void;
+  reduced: boolean;
 }
 
-export function RaffleSection({ board, config, configJson, rounds, error }: Props) {
-  // Seconds per block: what the chain does now, else the target, else 25 s.
-  const spacing = board?.recent_spacing_secs || config?.chain.target_spacing_secs || 25;
+export function RaffleSection({ board, config, configJson, rounds, pending, error, verify, onVerify, reduced }: Props) {
   return (
-    <Section id="live" title="Built with Zecraft: live on testnet">
-      <article id="raffle" aria-labelledby="raffle-title" className="raffle">
-        <h3 id="raffle-title" className="subheading">
-          Raffle
-        </h3>
-        <p>
-          Buy tickets with a shielded payment. When the round closes, a drand beacon published afterwards draws one ticket,
-          and the vault's keyholders pay its holder the whole pot.
+    <section id="raffle" className="wrap section" aria-labelledby="raffle-h">
+      <div className="eyebrow">proof</div>
+      <h2 id="raffle-h" className="h2 h2-tight">
+        Built with Zecraft: live on testnet
+      </h2>
+      <h3 className="raffle-sub">
+        <PixelIcon name="ticket" size={22} />
+        Raffle
+      </h3>
+      {error && (
+        <p className="error engine-error" role="alert">
+          The engine is not answering ({error}).
         </p>
-        {error && (
-          <p className="error" role="alert">
-            The engine is not answering ({error}).
-          </p>
-        )}
-        <CurrentRound board={board} spacing={spacing} />
+      )}
+      <div className="raffle-grid">
+        <CurrentRound board={board} config={config} />
         <HowToEnter config={config} configJson={configJson} board={board} />
-        <PastRounds rounds={rounds} />
-      </article>
-    </Section>
+      </div>
+      <PastRounds rounds={rounds} pending={pending} board={board} onVerify={onVerify} />
+      <VerifyRound request={verify} reduced={reduced} />
+    </section>
   );
 }

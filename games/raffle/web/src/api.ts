@@ -68,3 +68,10 @@ export const getConfigText = async () => {
 };
 export const getRounds = () => json<{ rounds: RoundSummary[] }>("/v1/rounds?limit=50").then((r) => r.rounds);
 export const proofPath = (round: number) => `/v1/rounds/${round}/proof`;
+
+/** A closed round the engine has not settled yet. */
+export interface PendingRound {
+  round: number;
+  status: string;
+}
+export const getPending = () => json<{ rounds: PendingRound[] }>("/v1/rounds/pending").then((r) => r.rounds);
