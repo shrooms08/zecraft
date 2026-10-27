@@ -2,6 +2,8 @@
 
 A game engine for fair, private games on shielded Zcash. Build one in a weekend.
 
+**Live:** [zecraft-production.up.railway.app](https://zecraft-production.up.railway.app): the testnet raffle, with every past round verifiable in your browser.
+
 ## What it is
 
 - An open-source Rust engine, with a WebAssembly verifier that runs in the browser.
@@ -10,6 +12,7 @@ A game engine for fair, private games on shielded Zcash. Build one in a weekend.
 
 ## Proof it works
 
+- The raffle runs live on testnet at [zecraft-production.up.railway.app](https://zecraft-production.up.railway.app). Press "Verify round 0 yourself": your browser fetches the chain data and runs all five checks (about 12 s).
 - The first live raffle round settled on Zcash testnet: round 0, payout transaction
   `2c3b07f1c2ea033f7c331a54ec9c49e5de9840a98141137923002154782e4922`.
   All five verification checks pass: [proof bundle](docs/examples/raffle-round-0.proof.json), [verifier output](docs/examples/raffle-round-0.verify.txt).
@@ -55,7 +58,7 @@ Private: who entered, which entries belong to the same person, and who won. Publ
 
 ## Known limits
 
-- **One operator.** In the local and hosted demo, one person runs all three keyholders. Production needs independent operators.
+- **One operator.** In the local and hosted demo, one person runs all three keyholders. The hosted raffle runs them in one Railway container ([deploy/railway](deploy/railway)). Production needs independent operators on separate machines.
 - **One testnet server.** No independent testnet lightwalletd answers right now. The verifier re-checks every proof and signature itself, but its chain data comes from one server.
 - **Testnet only.**
 
@@ -63,7 +66,7 @@ Private: who entered, which entries belong to the same person, and who won. Publ
 
 | Game | Status |
 |---|---|
-| [Raffle](games/raffle) | Live on testnet |
+| [Raffle](games/raffle) | Live on testnet: [zecraft-production.up.railway.app](https://zecraft-production.up.railway.app) |
 | [Coin flip](games/coinflip) | Example, and the `zecraft new` template |
 | Zeek | The game Zecraft was extracted from: [playzeek.pages.dev](https://playzeek.pages.dev), [github.com/shrooms08/zeek](https://github.com/shrooms08/zeek) |
 
