@@ -22,7 +22,7 @@
 //!    zero-valued note to `A`), so its value balance is **+1**. It proves the
 //!    bundle with the Orchard-protocol circuit and signs it, spend
 //!    authorization and binding signature, over the message
-//!    `BLAKE2b-256("ZeekWinProofV1__", "zeek-win-proof/v1" ‖ network ‖ round ‖
+//!    `BLAKE2b-256("ZecraftWinPrf_v1", "zecraft-win-proof/v1" ‖ network ‖ round ‖
 //!    payout txid ‖ k ‖ recipient ‖ nonce)` instead of a transaction sighash.
 //!
 //! # Why not a zero-value note
@@ -94,9 +94,9 @@ use crate::chain::{parse_tx, txid_bytes, MinedTx};
 use crate::checks::{opening_cmx, verifying_key};
 
 /// Domain string bound into every win proof message.
-pub const DOMAIN: &[u8] = b"zeek-win-proof/v1";
+pub const DOMAIN: &[u8] = b"zecraft-win-proof/v1";
 /// BLAKE2b personalization of the message hash (16 bytes).
-pub const PERSONALIZATION: &[u8; 16] = b"ZeekWinProofV1__";
+pub const PERSONALIZATION: &[u8; 16] = b"ZecraftWinPrf_v1";
 /// Format version of [`WinProof`].
 pub const WIN_PROOF_VERSION: u8 = 1;
 /// Largest encoded proof accepted (a one-action proof is about 7.4 kB).
@@ -373,7 +373,7 @@ impl WinProof {
     pub fn id(encoded: &[u8]) -> String {
         let hash = Params::new()
             .hash_length(32)
-            .personal(b"ZeekWinProofId__")
+            .personal(b"ZecraftWinPrfId_")
             .hash(encoded);
         hex::encode(&hash.as_bytes()[..16])
     }

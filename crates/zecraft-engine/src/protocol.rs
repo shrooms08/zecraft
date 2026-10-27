@@ -13,7 +13,7 @@ use crate::error::EngineError;
 use crate::identity::{self, Identity};
 
 /// Signature domain.
-pub const DOMAIN: &[u8] = b"zeek/keyholder/v1";
+pub const DOMAIN: &[u8] = b"zecraft/keyholder/v1";
 
 /// A session id.
 pub type SessionId = [u8; 32];

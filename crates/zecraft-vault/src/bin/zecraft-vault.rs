@@ -14,7 +14,7 @@ use zecraft_vault::{frost, keys, lightwalletd, send, wallet, VaultError};
 #[command(
     name = "zecraft-vault",
     version,
-    about = "2-of-3 FROST vault for Zeek (Zcash testnet)"
+    about = "2-of-3 FROST vault for Zecraft games (Zcash testnet)"
 )]
 struct Cli {
     #[command(subcommand)]

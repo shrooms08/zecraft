@@ -19,7 +19,7 @@
 //!
 //! The viewing key needs a nullifier key and a commitment randomness beside
 //! `ak`. They are derived from a **transcript seed**:
-//! `SHA-256("zeek/dkg-nk-rivk/v1" || group key || id_1 || round1_pkg_1 || …)`
+//! `SHA-256("zecraft/dkg-nk-rivk/v1" || group key || id_1 || round1_pkg_1 || …)`
 //! over every participant's round-1 package in identifier order. Each
 //! participant's package contains its own fresh randomness (the commitment to
 //! its secret polynomial), so no single participant can choose the seed, and
@@ -327,11 +327,11 @@ pub async fn run_ceremony(
     })
 }
 
-/// `SHA-256("zeek/dkg-nk-rivk/v1" || group key || (id BE || round1 package)*)`
+/// `SHA-256("zecraft/dkg-nk-rivk/v1" || group key || (id BE || round1 package)*)`
 /// over the packages in identifier order.
 pub fn transcript_seed(group_key: &[u8; 32], round1_packages: &BTreeMap<u16, Vec<u8>>) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"zeek/dkg-nk-rivk/v1");
+    hasher.update(b"zecraft/dkg-nk-rivk/v1");
     hasher.update(group_key);
     for (id, package) in round1_packages {
         hasher.update(id.to_be_bytes());

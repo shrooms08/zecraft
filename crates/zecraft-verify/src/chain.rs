@@ -28,7 +28,7 @@ pub fn branch_for(network: Network, height: u32) -> BranchId {
     }
 }
 
-/// Parses blocks as the Zeek relay serves them: per block a `u32`
+/// Parses blocks as the engine relay serves them: per block a `u32`
 /// little-endian length and the `CompactBlock` protobuf.
 pub fn decode_relay_blocks(bytes: &[u8]) -> Result<Vec<CompactBlock>, ChainDataError> {
     let mut rest = bytes;

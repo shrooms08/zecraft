@@ -1,7 +1,7 @@
 //! A pool of `lightwalletd` servers with health checks, per-request
 //! timeouts, failover and a block-hash consistency check.
 //!
-//! Every Zeek process that reads the chain (engine, keyholders, relay,
+//! Every Zecraft process that reads the chain (engine, keyholders, relay,
 //! `zecraft-player`) goes through a [`Pool`]:
 //!
 //! * Servers are tried in a preference order. Each keyholder rotates the
