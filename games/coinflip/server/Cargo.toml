@@ -1,0 +1,31 @@
+[package]
+name = "zecraft-coinflip-server"
+version = "0.1.0"
+description = "The coin flip's processes: round engine, keyholder and verifier, each the kit's generic server with the coin flip's Rules"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "zecraft-coinflip-engine"
+path = "src/bin/zecraft-coinflip-engine.rs"
+
+[[bin]]
+name = "zecraft-coinflip-keyholder"
+path = "src/bin/zecraft-coinflip-keyholder.rs"
+
+[[bin]]
+name = "zecraft-coinflip-verify"
+path = "src/bin/zecraft-coinflip-verify.rs"
+
+[dependencies]
+zecraft-coinflip = { path = "../rules" }
+zecraft-engine = { path = "../../../crates/zecraft-engine" }
+zecraft-keyholder = { path = "../../../crates/zecraft-keyholder" }
+zecraft-verify = { path = "../../../crates/zecraft-verify", features = ["cli"] }
+anyhow.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }

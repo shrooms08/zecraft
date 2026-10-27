@@ -1,0 +1,20 @@
+[package]
+name = "zecraft-coinflip"
+version = "0.1.0"
+description = "Zecraft example game: a coin flip (Rules implementation)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+zecraft-core = { path = "../../../crates/zecraft-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = ">=1.6, <1.7"
+rand = { version = "0.9", default-features = false, features = ["std_rng"] }

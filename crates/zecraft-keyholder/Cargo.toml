@@ -48,6 +48,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tempfile = "3"
 zecraft-raffle = { path = "../../games/raffle/rules" }
+zecraft-coinflip = { path = "../../games/coinflip/rules" }
+zecraft-verify = { path = "../zecraft-verify" }
 zecraft-engine = { path = "../zecraft-engine", features = ["testkit"] }
 incrementalmerkletree = "0.8.2"
 shardtree = "0.7"

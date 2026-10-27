@@ -4585,6 +4585,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zecraft-coinflip"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "zecraft-core",
+]
+
+[[package]]
+name = "zecraft-coinflip-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "zecraft-coinflip",
+ "zecraft-engine",
+ "zecraft-keyholder",
+ "zecraft-verify",
+]
+
+[[package]]
 name = "zecraft-core"
 version = "0.1.0"
 dependencies = [
@@ -4690,10 +4712,12 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_protocol",
+ "zecraft-coinflip",
  "zecraft-core",
  "zecraft-engine",
  "zecraft-raffle",
  "zecraft-vault",
+ "zecraft-verify",
  "zeroize",
 ]
 
