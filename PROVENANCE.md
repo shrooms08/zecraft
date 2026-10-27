@@ -205,3 +205,11 @@ Written new: `crates/zecraft-core/src/{draw/mod.rs,entry/mod.rs,rules.rs,proof.r
 rewritten), `games/raffle/rules/**`, `games/raffle/server/**`.
 `docs/examples/` stays verbatim: the 26 Zeek files are regression fixtures of
 the generic primitives (`crates/zecraft-core/tests/fixtures_zeek.rs`).
+
+## Phase C and D1 (written new in Zecraft)
+
+`scripts/local/*.sh`, `scripts/build-wasm.sh` (modelled on Zeek's
+`scripts/build-wasm.sh`, but stable and single-threaded), `config/*.json`,
+`games/raffle/wasm/**` (its JavaScript API follows Zeek's `crates/zeek-pocket`
+verifier exports), `games/raffle/web/**`, `docs/examples/raffle-round-0.*`,
+`docs/screenshots/*`.

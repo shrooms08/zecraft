@@ -215,6 +215,8 @@ async fn api_reads_stay_fast_while_the_pass_is_stalled() {
             zecraft_engine::api::MAX_STREAMS,
         )),
         relay: None,
+        relay_upstream: None,
+        web_dir: None,
         proof_limiter: zecraft_engine::relay::RateLimiter::new(10),
         keyholder_ids: vec![1, 2, 3],
         threshold: 2,

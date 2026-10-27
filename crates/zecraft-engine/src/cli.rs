@@ -119,6 +119,8 @@ async fn run<R: Rules + Clone>(
             Box::new(LightwalletdBackend::new(pool.clone())),
             RelayState::rate_from_env(),
         ))),
+        relay_upstream: settings.relay_upstream.clone(),
+        web_dir: settings.web_dir.clone(),
         proof_limiter: crate::relay::RateLimiter::new(crate::api::PROOF_SUBMISSIONS_PER_MIN),
     });
 

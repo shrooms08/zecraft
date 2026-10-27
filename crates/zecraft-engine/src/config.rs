@@ -109,6 +109,11 @@ pub const BIND_VAR: &str = "ZECRAFT_ENGINE_BIND";
 pub const CORS_VAR: &str = "ZECRAFT_ENGINE_CORS";
 pub const RELAYS_VAR: &str = "ZECRAFT_DRAND_RELAYS";
 pub const POLL_SECS_VAR: &str = "ZECRAFT_ENGINE_POLL_SECS";
+/// Directory of the built web page, served at `/`; unset serves no page.
+pub const WEB_DIR_VAR: &str = "ZECRAFT_WEB_DIR";
+/// Base URL of a relay `/relay/*` is forwarded to (for example the
+/// standalone `<game>-verify relay`); unset serves this engine's own relay there.
+pub const RELAY_UPSTREAM_VAR: &str = "ZECRAFT_RELAY_UPSTREAM";
 
 /// Default drand relays (League of Entropy, from docs.drand.love/developer/http-api):
 /// the drand.sh relays speak v2, Cloudflare only v1 (by chain hash).
@@ -139,6 +144,10 @@ pub struct EngineSettings {
     pub cors_origins: Vec<String>,
     pub relays: Vec<String>,
     pub poll_secs: u64,
+    /// `ZECRAFT_WEB_DIR`, when set.
+    pub web_dir: Option<PathBuf>,
+    /// `ZECRAFT_RELAY_UPSTREAM`, when set.
+    pub relay_upstream: Option<String>,
 }
 
 impl EngineSettings {
@@ -204,6 +213,8 @@ impl EngineSettings {
             cors_origins: list(var(CORS_VAR)?, ""),
             relays: list(var(RELAYS_VAR)?, DEFAULT_RELAYS),
             poll_secs,
+            web_dir: var(WEB_DIR_VAR)?.map(PathBuf::from),
+            relay_upstream: var(RELAY_UPSTREAM_VAR)?,
         })
     }
 }

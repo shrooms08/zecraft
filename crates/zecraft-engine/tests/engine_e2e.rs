@@ -421,9 +421,18 @@ async fn http_api_serves_the_round() {
             zecraft_engine::api::MAX_STREAMS,
         )),
         relay: None,
+        relay_upstream: None,
+        web_dir: None,
         proof_limiter: zecraft_engine::relay::RateLimiter::new(10),
         keyholder_ids: vec![1, 2, 3],
         threshold: 2,
+    });
+    let web = tempfile::tempdir().expect("web dir");
+    std::fs::write(web.path().join("index.html"), "<title>Zecraft</title>").expect("index");
+    std::fs::write(web.path().join("app.js"), "console.log(1)").expect("asset");
+    let state = Arc::new(AppState {
+        web_dir: Some(web.path().to_path_buf()),
+        ..Arc::try_unwrap(state).unwrap_or_else(|_| panic!("unique"))
     });
     let app = router(state, &["http://localhost:7173".to_owned()]);
 
@@ -448,6 +457,20 @@ async fn http_api_serves_the_round() {
             .to_vec();
         (status, body)
     }
+
+    // The page: files, and index.html for any other path; the API still wins.
+    let (status, body) = get(&app, "/").await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).contains("Zecraft")),
+        (StatusCode::OK, true)
+    );
+    let (status, body) = get(&app, "/app.js").await;
+    assert_eq!((status, body), (StatusCode::OK, b"console.log(1)".to_vec()));
+    let (status, body) = get(&app, "/rounds/0").await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).contains("Zecraft")),
+        (StatusCode::OK, true)
+    );
 
     let (status, body) = get(&app, "/v1/health").await;
     assert_eq!(status, StatusCode::OK);
@@ -510,6 +533,8 @@ async fn http_api_serves_the_round() {
     assert_eq!(rounds.rounds.len(), 1, "round 0 had entries");
     assert_eq!(rounds.rounds[0].status, "paying");
     assert_eq!((rounds.rounds[0].wins, rounds.rounds[0].refunds), (1, 2));
+    assert_eq!(rounds.rounds[0].game["tickets_sold"], 6);
+    assert_eq!(rounds.rounds[0].drand_round, FIXTURE_ROUND);
     let (status, body) = get(&app, "/v1/rounds/0/digests").await;
     assert_eq!(status, StatusCode::OK);
     let digests: zecraft_engine::api::DigestsResponse =

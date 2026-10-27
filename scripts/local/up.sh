@@ -9,6 +9,8 @@ B=./target/release
 S=.zecraft/secrets
 D=.zecraft/data
 GAME_CONFIG=config/raffle.testnet.json
+# The built page (cd games/raffle/web && npm run wasm && npm run build).
+WEB_DIR=games/raffle/web/dist
 ENGINE_LWD=${ZECRAFT_ENGINE_LWD:-https://testnet.zec.rocks:443}
 # zaino first (independent of the engine); testnet.zec.rocks keeps the relay up
 # while zaino is down (it was, HTTP 503, during Phase C).
@@ -37,6 +39,8 @@ for n in 1 2 3; do
   start "kh$n" "770$n" "$B/zecraft-raffle-keyholder" serve --config "config/keyholder-$n.json"
 done
 
+start relay 7790 "$B/zecraft-raffle-verify" relay --lightwalletd "$RELAY_LWD" --bind 127.0.0.1:7790
+
 start engine 7787 env \
   ZECRAFT_GAME_CONFIG="$GAME_CONFIG" \
   ZECRAFT_ENGINE_DB="$D/engine.sqlite" \
@@ -46,9 +50,10 @@ start engine 7787 env \
   ZECRAFT_COORDINATOR_IDENTITY="$S/coordinator/identity.json" \
   ZECRAFT_VAULT_SECRETS_DIR="$S/vault" \
   ZECRAFT_VAULT_DATA_DIR="$D/wallet" \
+  ZECRAFT_WEB_DIR="$WEB_DIR" \
+  ZECRAFT_RELAY_UPSTREAM=http://127.0.0.1:7790 \
   "$B/zecraft-raffle-engine"
 
-start relay 7790 "$B/zecraft-raffle-verify" relay --lightwalletd "$RELAY_LWD" --bind 127.0.0.1:7790
 
 echo "== health"
 wait_port() { # name port
@@ -60,8 +65,8 @@ wait_port() { # name port
   tail -20 ".zecraft/logs/$1.log" >&2; die "$1 is not listening on $2 after 60 s"
 }
 for n in 1 2 3; do wait_port "kh$n" "770$n"; done
-wait_port engine 7787
 wait_port relay 7790
+wait_port engine 7787
 for n in 1 2 3; do
   curl -fsS "http://127.0.0.1:770$n/v1/health" >/dev/null || die "keyholder $n /v1/health failed"
 done
@@ -71,4 +76,10 @@ c=json.load(sys.stdin)
 assert c["entries_open"], "entries are closed"
 print("engine /v1/config: network %s, genesis %d, ticket %d zat, memo %s" % (c["chain"]["network"], c["chain"]["genesis_height"], c["game"]["ticket_price_zat"], c["memo"]["magic"]))
 ' || die "engine /v1/config failed"
+if [ -f "$WEB_DIR/index.html" ]; then
+  curl -fsS -o /dev/null http://127.0.0.1:7787/ && echo "web page served at http://127.0.0.1:7787/"
+  curl -fsS -o /dev/null "http://127.0.0.1:7787/relay/v1/chain/tip" && echo "relay proxied at /relay"
+else
+  echo "no web build in $WEB_DIR (the API runs without the page)"
+fi
 echo "all up"

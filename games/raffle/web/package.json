@@ -1,0 +1,28 @@
+{
+  "name": "@zecraft/raffle-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "description": "The Zecraft page: the game engine, and its first game (the testnet raffle), served by the engine",
+  "scripts": {
+    "wasm": "sh ../../../scripts/build-wasm.sh",
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "qrcode": "1.5.4",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/qrcode": "1.5.5",
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "5.0.2",
+    "playwright": "^1.64.1",
+    "typescript": "5.9.2",
+    "vite": "7.1.12"
+  }
+}

@@ -47,6 +47,11 @@ pub struct AppState<R: Rules> {
     pub stream_slots: Arc<tokio::sync::Semaphore>,
     /// Present when this engine relays chain data to browser wallets.
     pub relay: Option<Arc<crate::relay::RelayState>>,
+    /// Where `/relay/*` goes: another relay (proxied, GET only), or this
+    /// engine's own relay when `None`.
+    pub relay_upstream: Option<String>,
+    /// The built web page, served at `/` (with `index.html` for unknown paths).
+    pub web_dir: Option<std::path::PathBuf>,
     /// Configured keyholder identifiers and the signing threshold (empty
     /// when this engine does not coordinate payouts).
     pub keyholder_ids: Vec<u16>,
@@ -238,6 +243,30 @@ pub fn router<R: Rules>(state: Arc<AppState<R>>, cors_origins: &[String]) -> Rou
     if let Some(relay) = &state.relay {
         router = router.merge(crate::relay::router(relay.clone()));
     }
+    // One origin for the browser: the relay also under /relay.
+    match (&state.relay_upstream, &state.relay) {
+        (Some(upstream), _) => {
+            let proxy = Arc::new(RelayProxy {
+                upstream: upstream.trim_end_matches('/').to_owned(),
+                http: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .unwrap_or_default(),
+            });
+            router = router.route("/relay/{*path}", get(relay_proxy).with_state(proxy));
+        }
+        (None, Some(relay)) => {
+            router = router.nest("/relay", crate::relay::router(relay.clone()));
+        }
+        (None, None) => {}
+    }
+    if let Some(dir) = &state.web_dir {
+        let index = dir.join("index.html");
+        router = router.fallback_service(
+            tower_http::services::ServeDir::new(dir)
+                .fallback(tower_http::services::ServeFile::new(index)),
+        );
+    }
     if !cors_origins.is_empty() {
         let origins: Vec<HeaderValue> = cors_origins
             .iter()
@@ -251,6 +280,56 @@ pub fn router<R: Rules>(state: Arc<AppState<R>>, cors_origins: &[String]) -> Rou
         );
     }
     router
+}
+
+/// `/relay/*` forwarded to another relay.
+pub struct RelayProxy {
+    upstream: String,
+    http: reqwest::Client,
+}
+
+/// Largest relay response passed through (500 compact blocks fit easily).
+const MAX_PROXIED_BYTES: usize = 32 * 1024 * 1024;
+
+async fn relay_proxy(
+    State(proxy): State<Arc<RelayProxy>>,
+    Path(path): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    // Only the relay's own read routes are forwarded.
+    if !(path.starts_with("v1/chain/") || path.starts_with("v1/tx/")) || path.contains("..") {
+        return bad(StatusCode::NOT_FOUND, "not a relay route").into_response();
+    }
+    let url = match query {
+        Some(q) => format!("{}/{path}?{q}", proxy.upstream),
+        None => format!("{}/{path}", proxy.upstream),
+    };
+    let upstream = match proxy.http.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "relay upstream unreachable");
+            return bad(StatusCode::BAD_GATEWAY, "the relay upstream is unreachable")
+                .into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    match upstream.bytes().await {
+        Ok(body) if body.len() <= MAX_PROXIED_BYTES => (
+            status,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            body,
+        )
+            .into_response(),
+        Ok(_) => bad(StatusCode::BAD_GATEWAY, "relay response too large").into_response(),
+        Err(_) => bad(StatusCode::BAD_GATEWAY, "relay response cut off").into_response(),
+    }
 }
 
 /// The public config response (`entries_open`: whether entries are open).
@@ -484,6 +563,10 @@ pub struct RoundSummary {
     pub status: String,
     /// The game's outcome.
     pub outcome: serde_json::Value,
+    /// The game's board of the round (`Rules::board`), as-is.
+    pub game: serde_json::Value,
+    /// The drand round that decided it.
+    pub drand_round: u64,
     pub received: u64,
     pub paid: u64,
     pub carry_out: u64,
@@ -527,10 +610,15 @@ pub fn round_summary<R: Rules>(
         "paying"
     };
     let window = zecraft_core::draw::round_window(&processor.config().chain, row.round)?;
+    let classified = processor.classified(db, row.round, row.voided)?;
     Ok(RoundSummary {
         round: row.round,
         status: status.to_owned(),
         outcome: s.outcome.clone(),
+        game: processor
+            .rules()
+            .board(&processor.config().game, &classified),
+        drand_round: row.drand_round,
         received: s.received,
         paid: s.paid,
         carry_out: s.carry_out,

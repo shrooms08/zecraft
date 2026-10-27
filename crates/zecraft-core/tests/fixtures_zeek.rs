@@ -69,7 +69,13 @@ fn files(suffix: &str) -> Vec<PathBuf> {
             let path = entry.expect("entry").path();
             if path.is_dir() {
                 walk(&path, suffix, out);
-            } else if path.to_string_lossy().ends_with(suffix) {
+            } else if path.to_string_lossy().ends_with(suffix)
+                // Zecraft's own rounds (raffle-round-*.json) live next to
+                // Zeek's fixtures; they are tested by games/raffle.
+                && !path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("raffle-"))
+            {
                 out.push(path);
             }
         }
