@@ -13,6 +13,7 @@ export function PrivacyNote() {
             <strong>Private:</strong> who entered, which entries belong to the same person, and who won. <strong>Public by design:</strong> each entry's amount and ticket
             count, and every payout amount, via the published testnet viewing key, so anyone can verify the draw.
           </p>
+          <p className="muted small">Demo setup: one operator runs all three keyholders. Production needs independent operators.</p>
         </div>
       </div>
     </section>

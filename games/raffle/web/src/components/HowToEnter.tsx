@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Board, GameConfig } from "../api";
 import { taz } from "../format";
 import { sealEntry, type Entry } from "../wasm";
@@ -34,16 +34,28 @@ function Steps({ config, configJson, board, vault }: { config: GameConfig; confi
   const n = Math.max(1, Math.min(1000, Math.floor(Number(tickets)) || 1));
   const closing = !board || board.status !== "open" || board.blocks_remaining < MIN_BLOCKS_LEFT;
 
+  // A payment request belongs to the inputs it was built from: any edit
+  // withdraws it until "Create payment" builds a new one, and a request
+  // still being sealed when an edit happens is dropped when it arrives.
+  const inputs = useRef(0);
+  function edit<T>(set: (value: T) => void, value: T) {
+    inputs.current += 1;
+    setEntry(null);
+    set(value);
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!board) return;
     setBusy(true);
     setError(null);
     setEntry(null);
+    const built = inputs.current;
     try {
-      setEntry(await sealEntry(configJson, board.round, n, payout.trim(), textMemo));
+      const sealed = await sealEntry(configJson, board.round, n, payout.trim(), textMemo);
+      if (inputs.current === built) setEntry(sealed);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (inputs.current === built) setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -58,14 +70,9 @@ function Steps({ config, configJson, board, vault }: { config: GameConfig; confi
       <li>
         <span className="step-num" aria-hidden="true">1</span>
         <div className="step-body">
-          <span className="step-head">Copy the vault address</span>
-          <div className="vault-row">
-            <div className="vault-text">
-              <code className="addr">{vault}</code>
-              <CopyButton text={vault} label="Copy address" />
-            </div>
-            <QrCode value={vault} label="QR code of the vault address" size={132} />
-          </div>
+          <span className="step-head">The vault address</span>
+          <code className="addr">{vault}</code>
+          <p className="warn small">Pay with the payment link in step 3. A payment without its memo can't be refunded.</p>
         </div>
       </li>
       <li>
@@ -75,18 +82,18 @@ function Steps({ config, configJson, board, vault }: { config: GameConfig; confi
           <div className="form-row">
             <div className="field field-tickets">
               <label htmlFor="zc-tickets">Tickets</label>
-              <input id="zc-tickets" type="number" min={1} max={1000} value={tickets} required onChange={(e) => setTickets(e.target.value)} />
+              <input id="zc-tickets" type="number" min={1} max={1000} value={tickets} required onChange={(e) => edit(setTickets, e.target.value)} />
             </div>
             <div className="field field-payout">
               <label htmlFor="zc-payout">Your payout address (fresh, goes in the shielded memo)</label>
-              <input id="zc-payout" type="text" value={payout} required placeholder="utest1..." spellCheck={false} autoComplete="off" onChange={(e) => setPayout(e.target.value)} />
+              <input id="zc-payout" type="text" value={payout} required placeholder="utest1..." spellCheck={false} autoComplete="off" onChange={(e) => edit(setPayout, e.target.value)} />
             </div>
             <button type="submit" className="btn btn-primary" disabled={busy || closing}>
               {busy ? "Sealing..." : "Create payment"}
             </button>
           </div>
           <label className="checkbox">
-            <input type="checkbox" checked={textMemo} onChange={(e) => setTextMemo(e.target.checked)} />
+            <input type="checkbox" checked={textMemo} onChange={(e) => edit(setTextMemo, e.target.checked)} />
             Text memo (for wallets that only send text memos)
           </label>
           <span className="mono muted small">

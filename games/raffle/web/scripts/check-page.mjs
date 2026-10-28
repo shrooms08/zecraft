@@ -2,9 +2,12 @@
 //   node scripts/check-page.mjs http://127.0.0.1:7787 <payout UA> ../../../docs/screenshots
 //
 // Checks: the page loads, the live board renders, round 0 verifies 5/5 in
-// the browser (started from the proof strip), "Create payment" builds a
-// zcash: URI and a QR, no console errors, no horizontal overflow at 390 px,
-// text contrast, keyboard reachability with a visible focus ring.
+// the browser (started from the proof strip), nothing offers the bare vault
+// address to pay (no QR or copy button before a request exists), "Create
+// payment" builds a zcash: URI and a QR, editing the tickets or the payout
+// address withdraws that request, rounds whose entries were all refunded say
+// "refunded", no console errors, no horizontal overflow at 390 px, text
+// contrast, keyboard reachability with a visible focus ring.
 // Screenshots are taken with prefers-reduced-motion, so nothing moves.
 import { chromium } from "playwright";
 import { mkdirSync } from "node:fs";
@@ -83,6 +86,29 @@ try {
     stats: (await page.locator(".stat-grid").innerText()).replace(/\s+/g, " ").trim(),
   };
   result.pastRounds = (await page.locator(".past-rounds .rounds-list > li").allInnerTexts()).map((t) => t.replace(/\s+/g, " ").trim());
+  // A round whose entries were all refunded (no tickets sold, refunds paid)
+  // is labelled "refunded", never "carried over" (nothing was carried).
+  result.refundedRounds = await page.evaluate(async () => {
+    const { rounds } = await (await fetch("/v1/rounds?limit=50")).json();
+    return rounds
+      .filter((r) => r.status === "no_win" && r.refunds > 0 && r.game.tickets_sold === 0)
+      .map((r) => {
+        const row = document.querySelector(`.round-row[data-round="${r.round}"]`);
+        return row ? { round: r.round, label: row.querySelectorAll("dd")[1]?.textContent?.trim() } : null;
+      })
+      .filter(Boolean);
+  });
+  // Before a payment request exists, nothing on the page offers the bare
+  // vault address to pay: no QR, no copy button in step 1, and step 1 points
+  // to the step-3 link (a payment without its memo can't be refunded).
+  result.step1 = await page.evaluate(() => {
+    const step = document.querySelector(".enter-steps > li");
+    return {
+      qrs: document.querySelectorAll(".how-to-enter .qr").length,
+      buttons: step ? step.querySelectorAll("button").length : -1,
+      text: step ? step.innerText.replace(/\s+/g, " ").trim() : "",
+    };
+  });
   result.terminal = await page.locator(".term-body").innerText();
 
   // Verify round 0 from the proof strip.
@@ -132,17 +158,43 @@ try {
   await page.getByLabel("Tickets").fill("2");
   await page.getByLabel(/Your payout address/).fill(payout);
   const create = page.getByRole("button", { name: "Create payment" });
-  await create.waitFor({ state: "visible" });
-  await page.waitForFunction(() => {
-    const b = [...document.querySelectorAll("button")].find((x) => x.textContent?.trim() === "Create payment");
-    return b && !b.disabled;
-  }, null, { timeout: 600000 });
-  await create.click();
   const link = page.locator(".entry-request a", { hasText: "Open payment link" });
-  await link.waitFor({ timeout: 60000 });
+  const createPayment = async () => {
+    await create.waitFor({ state: "visible" });
+    await page.waitForFunction(() => {
+      const b = [...document.querySelectorAll("button")].find((x) => x.textContent?.trim() === "Create payment");
+      return b && !b.disabled;
+    }, null, { timeout: 600000 });
+    await create.click();
+    await link.waitFor({ timeout: 60000 });
+  };
+  await createPayment();
   result.entryUri = await link.getAttribute("href");
   result.entryText = (await page.locator(".entry-text > span").first().textContent())?.trim();
   result.entryQr = await page.locator(".entry-request img.qr").evaluate((img) => img.src.startsWith("data:image/png") && img.naturalWidth > 0);
+  // A built request is withdrawn as soon as what it was built from changes,
+  // so step 3 never offers a link for other tickets or another address.
+  await page.getByLabel("Tickets").fill("3");
+  result.requestAfterTicketEdit = await page.locator(".entry-request").count();
+  await createPayment();
+  result.rebuiltText = (await page.locator(".entry-text > span").first().textContent())?.trim();
+  await page.getByLabel(/Your payout address/).fill("");
+  result.requestAfterPayoutEdit = await page.locator(".entry-request").count();
+  // An edit made while a request is still being sealed (the first one loads
+  // the wasm) wins: the late result is dropped, not shown for the old inputs.
+  const fresh = await ctx.newPage();
+  watch(fresh, "race");
+  await fresh.goto(url, { waitUntil: "load" });
+  await fresh.getByLabel("Tickets").fill("2");
+  await fresh.getByLabel(/Your payout address/).fill(payout);
+  await fresh.waitForFunction(() => {
+    const b = [...document.querySelectorAll("button")].find((x) => x.textContent?.trim() === "Create payment");
+    return b && !b.disabled;
+  }, null, { timeout: 600000 });
+  await fresh.getByRole("button", { name: "Create payment" }).click();
+  await fresh.getByLabel("Tickets").fill("3");
+  await fresh.waitForTimeout(3000);
+  result.requestAfterEditWhileSealing = await fresh.locator(".entry-request").count();
   await ctx.close();
 
   // 2. Desktop with motion: animations run without errors.
@@ -190,6 +242,14 @@ const ok =
   result.checks.every((c) => / pass$/.test(c)) &&
   /^zcash:/.test(result.entryUri ?? "") &&
   result.entryQr === true &&
+  result.step1.qrs === 0 &&
+  result.step1.buttons === 0 &&
+  /payment link in step 3/.test(result.step1.text) &&
+  result.requestAfterTicketEdit === 0 &&
+  /for 3 tickets/.test(result.rebuiltText ?? "") &&
+  result.requestAfterPayoutEdit === 0 &&
+  result.requestAfterEditWhileSealing === 0 &&
+  result.refundedRounds.every((r) => r.label === "refunded") &&
   errors.length === 0 &&
   !result.mobile.horizontalScroll &&
   result.mobile.overflowing.length === 0 &&

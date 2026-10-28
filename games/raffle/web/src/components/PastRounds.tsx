@@ -81,8 +81,16 @@ export function PastRounds({ rounds, pending, board, onVerify }: Props) {
   );
 }
 
+/** A round whose entries were all refunded carried nothing over. */
+function statusOf(r: RoundSummary) {
+  if (r.status === "no_win" && r.refunds > 0 && r.game.tickets_sold === 0) {
+    return { text: "refunded", tone: "muted" };
+  }
+  return STATUS[r.status];
+}
+
 function RoundRow({ r, onVerify }: { r: RoundSummary; onVerify: (round: number) => void }) {
-  const status = STATUS[r.status];
+  const status = statusOf(r);
   const fields: [string, string, string?][] = [
     ["round", String(r.round)],
     ["tickets", String(r.game.tickets_sold)],
