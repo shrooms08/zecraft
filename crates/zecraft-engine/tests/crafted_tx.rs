@@ -281,10 +281,13 @@ async fn a_source_altering_a_real_entry_is_an_error_not_a_skip() {
     let Scenario { vault, chain } = scenario(0);
     let target = first_entry(&chain);
     let mut source = Altering { chain, target };
-    let outcome = follow_and_settle(&mut source, &vault).await;
+    let err = follow_and_settle(&mut source, &vault)
+        .await
+        .err()
+        .expect("an altered real entry must stop ingestion (and fail over), never be dropped");
     assert!(
-        outcome.is_err(),
-        "an altered real entry must stop ingestion (and fail over), never be dropped"
+        err.to_string().contains("does not hash to this txid"),
+        "stopped because the bytes are not the transaction: {err}"
     );
 }
 
